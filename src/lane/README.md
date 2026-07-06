@@ -55,11 +55,18 @@ update_entities :: proc() {
 ## Distributing work
 
 **`range` — static schedule.** Zero contention; the right default when items
-cost roughly the same:
+cost roughly the same. `range` is an overload group: pass a length and get
+index bounds, or pass a slice and get this lane's sub-slice plus its base
+index (for writing to parallel arrays):
 
 ```odin
-lo, hi := lane.range(len(items));
+lo, hi := lane.range(len(items));           // index form
 for i in lo ..< hi do process(&items[i]);
+```
+
+```odin
+chunk, base := lane.range(items);           // slice form: chunk[j] is items[base + j]
+for &item in chunk do process(&item);
 ```
 
 **`grab` — dynamic schedule.** When per-item cost varies wildly (pathfinding
@@ -89,9 +96,9 @@ everything. This degrades serially like everything else: one lane, `share`
 returns the lane's own pointer, `sync` no-ops, and the loop just eats all
 chunks.
 
-`grab` is an overload group: pass a slice and get sub-slices back, or pass a
-length and get index ranges. The slice form also yields the chunk's base
-index, for writing to parallel arrays:
+Like `range`, `grab` is an overload group: pass a slice and get sub-slices
+back, or pass a length and get index ranges. The slice form also yields the
+chunk's base index, for writing to parallel arrays:
 
 ```odin
 for lo, hi in lane.grab(&cursor, len(items), 16) { ... }
@@ -205,6 +212,53 @@ farthest     := lane.maximum(local_farthest);
 if lane.any_of(local_hit)   { ... }              // did anyone hit?
 if lane.all_of(local_valid) { ... }              // is everyone valid?
 ```
+
+**`any_of` / `all_of`** are the boolean reductions — OR and AND across the
+lanes — but their real job is making a lane-dependent condition **uniform**:
+after the call, every lane holds the same answer, so every lane takes the
+same branch. That is exactly what the barrier rule demands. This deadlocks:
+
+```odin
+// WRONG: lanes that found nothing skip the sync the others are waiting at.
+if local_dirty {
+    rebuild_grid();
+    lane.sync();
+}
+```
+
+Reduce first, branch after — now the `if` is all-or-nothing, and the body
+may freely contain syncs and collectives:
+
+```odin
+if lane.any_of(local_dirty) {   // one lane's dirt is everyone's problem
+    rebuild_grid();
+    lane.sync();
+}
+```
+
+The same reasoning applies to loops: a lane may not leave a loop early if
+the body contains collectives, so the exit condition must be collective too.
+`all_of` at the bottom keeps the iteration count identical on every lane —
+the canonical shape for iterating until convergence:
+
+```odin
+relax :: proc() {
+    lo, hi := lane.range(len(g_constraints));
+    for {
+        max_err: f32 = 0;
+        for i in lo ..< hi do max_err = max(max_err, solve_constraint(i));
+        if lane.all_of(max_err < EPSILON) do break; // every lane exits together
+    }
+}
+```
+
+No separate `sync` is needed before the vote: like every collective,
+`all_of` synchronizes internally, so it doubles as the phase boundary —
+each iteration's writes land before any lane starts the next one.
+
+Both follow the serial degradation rule: outside a split they return their
+argument, so `any_of(hit)` is just `hit` and the code above stays correct
+single-threaded.
 
 Custom folds with `reduce` — e.g. fitting bounds for shadow cascades:
 
@@ -320,7 +374,7 @@ Debug builds keep every check; the release target (`-disable-assert
 | `index()` / `count()` / `is_main()` | This lane's identity. Serial: `0` / `1` / `true`. |
 | `capacity()` | Configured lane count, valid outside splits; for sizing per-lane storage. |
 | `user_data()` / `user_data(^T)` | The split's user pointer, raw or cast. |
-| `range(n) -> (lo, hi)` | This lane's static share of `n` items. |
+| `range(n or slice)` | This lane's static share: `(lo, hi)` bounds from a length, `(sub-slice, base index)` from a slice. |
 | `grab(&cursor, n or slice, chunk_size)` | Dynamic chunking off a shared atomic cursor. |
 | `sync()` | Barrier across all lanes. |
 | `free_all_temp_allocators()` | Reset every lane's temp arena, main's included — replaces the end-of-frame `free_all`. Once per frame, inside or outside a split. |

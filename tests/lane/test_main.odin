@@ -134,6 +134,11 @@ sum_work :: proc() {
     s := 0;
     for i in lo ..< hi do s += _data[i];
 
+    // Slice overload must agree with the index form.
+    chunk, base := lane.range(_data[:]);
+    assert(base == lo && len(chunk) == hi - lo, "range slice form disagrees with index form");
+    assert(hi == lo || &chunk[0] == &_data[lo], "range slice chunk misaligned with base index");
+
     total := lane.sum(s);
     assert(total == EXPECTED_SUM, "lane.sum wrong on some lane");
     if lane.is_main() do _total = total;
@@ -208,6 +213,8 @@ case_smoke :: proc() {
     // Serial fallback: lane.range outside a split covers everything.
     lo, hi := lane.range(N);
     assert(lo == 0 && hi == N, "serial fallback failed");
+    chunk, base := lane.range(_data[:]);
+    assert(base == 0 && len(chunk) == N, "serial slice fallback failed");
 }
 
 

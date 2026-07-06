@@ -357,7 +357,20 @@ maximum :: proc "contextless" (value: $T) -> T where size_of(T) <= MAX_COLLECTIV
     return acc;
 }
 
-// True if the value is true on any lane / on all lanes.
+// True if the value is true on any lane (any_of) / on all lanes (all_of).
+// Beyond the reduction itself, these make a lane-dependent condition
+// uniform -- every lane gets the same answer, so every lane takes the same
+// branch. Required whenever a branch or loop exit guards collectives, which
+// every lane must reach:
+//     if lane.any_of(local_dirty) {           // all-or-nothing branch
+//         rebuild_grid();
+//         lane.sync();                        // safe: no lane skipped the if
+//     }
+//     for {                                   // iterate until convergence
+//         err := relax_my_share();
+//         if lane.all_of(err < EPSILON) do break; // all lanes exit together
+//     }
+// Outside a split they return the value unchanged.
 any_of :: proc "contextless" (value: bool) -> bool {
     if !_state.active do return value;
     _slot(bool, _state.index)^ = value;
@@ -425,13 +438,24 @@ scan_custom :: proc "contextless" (value: $T, identity: T, combine: proc "contex
 // lane 1: lo = 3, hi = 6
 // lane 2: lo = 6, hi = 9
 // lane 3: lo = 9, hi = 11
-range :: proc "contextless" (n: int) -> (lo, hi: int) {
+// An overload group: pass a length and get index bounds, or pass a slice
+// and get this lane's sub-slice plus its base index:
+//     lo, hi := lane.range(len(items));
+//     chunk, base := lane.range(items);   // chunk[j] is items[base + j]
+range :: proc { range_index, range_slice }
+
+range_index :: proc "contextless" (n: int) -> (lo, hi: int) {
     idx, cnt := index(), count();
     per := n / cnt;
     rem := n % cnt;
     lo = idx * per + min(idx, rem);
     hi = lo + per + (1 if idx < rem else 0);
     return;
+}
+
+range_slice :: proc "contextless" (s: []$T) -> (chunk: []T, lo: int) {
+    l, h := range_index(len(s));
+    return s[l:h], l;
 }
 
 // Grabs the next chunk of at most chunk_size values from a shared cursor,
@@ -447,7 +471,8 @@ range :: proc "contextless" (n: int) -> (lo, hi: int) {
 //     }
 //     lane.sync();
 // Without the share every lane would spin its own cursor and process
-// everything. Index form, and slice form with the chunk's base index:
+// everything. Like range, an overload group — index form, and slice form
+// with the chunk's base index:
 //     for lo, hi in lane.grab(cursor_ptr, len(items), 16) { ... }
 //     for chunk, lo in lane.grab(cursor_ptr, items, 16) { ... } // chunk[j] is items[lo + j]
 grab :: proc { grab_index, grab_slice }
