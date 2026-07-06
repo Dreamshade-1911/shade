@@ -30,6 +30,7 @@ Case :: struct {
 CASES :: []Case {
     { "smoke",             .Ok,   "normal use: 200 splits, re-init, 1-lane mode, serial fallback" },
     { "grab",              .Ok,   "dynamic chunking: every index covered exactly once, ragged chunks, n=0, serial use" },
+    { "owns",              .Ok,   "task dispatch: every task owned exactly once, by lane n % count, serial fallback" },
     { "collectives",       .Ok,   "reduce/sum/minimum/maximum/any_of/all_of/scan: fold order, vectors, compaction, serial degrade" },
     { "nested_split",      .Die,  "lane.split from inside a split (main lane)" },
     { "worker_split",      .Die,  "lane.split from inside a split (worker lane)" },
@@ -109,6 +110,7 @@ run_case :: proc(name: string) {
     switch name {
     case "smoke":             case_smoke();
     case "grab":              case_grab();
+    case "owns":              case_owns();
     case "collectives":       case_collectives();
     case "nested_split":      case_nested_split();
     case "worker_split":      case_worker_split();
@@ -128,6 +130,32 @@ run_case :: proc(name: string) {
 
 
 // ---------------------------------------------------------------- positive
+
+owns_work :: proc() {
+    // Owned task numbers are disjoint across lanes, so these writes don't race.
+    for i in 0 ..< N {
+        if lane.owns(i) {
+            assert(lane.index() == i % lane.count(), "owns picked the wrong lane");
+            _seen[i] += 1;
+        }
+    }
+    // Task 0 belongs to lane 0, so owns(0) is is_main.
+    assert(lane.owns(0) == lane.is_main(), "owns(0) must match is_main");
+}
+
+case_owns :: proc() {
+    lane.init(4);
+
+    // Every task owned exactly once, by lane i % count.
+    for i in 0 ..< N do _seen[i] = 0;
+    lane.split(owns_work);
+    for i in 0 ..< N do assert(_seen[i] == 1, "task unowned or owned twice");
+
+    lane.deinit();
+
+    // Serial fallback: one lane owns every task.
+    for i in 0 ..< N do assert(lane.owns(i), "serial owns must own everything");
+}
 
 sum_work :: proc() {
     lo, hi := lane.range(N);

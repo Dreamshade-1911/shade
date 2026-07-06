@@ -108,6 +108,25 @@ for chunk, lo in lane.grab(&cursor, items, 16) { ... }  // chunk[j] is items[lo 
 Pick the chunk size so that a chunk is meaningful work (hundreds of cycles at
 least); tiny chunks turn the cursor into a contention point.
 
+**`owns` — dispatching tasks by number.** Where `range` and `grab` split a
+loop, `lane.owns(n)` hands out whole tasks: it is true on exactly one lane,
+the one that owns task `n` (`n % count()`). Number the tasks you know are
+independent and dispatch them without caring how many lanes are actually
+running — the modulo folds any task count onto any lane count, so the same
+code works on 16 lanes, on 2, or serially (where the one lane owns every
+task):
+
+```odin
+if lane.owns(0) do step_physics();
+if lane.owns(1) do step_audio();
+if lane.owns(2) do step_particles();   // folds onto lane 0 with 2 lanes
+```
+
+The task number doubles as a stable identity for managing per-task data.
+`lane.is_main()` is the same test with the lane chosen for you — it picks
+the main lane, for work that must run there like main-thread-only APIs
+(equivalent to `lane.owns(0)`).
+
 ## Synchronizing: `sync`
 
 `lane.sync()` is a barrier: no lane continues until all lanes arrive. Use it
@@ -376,6 +395,7 @@ Debug builds keep every check; the release target (`-disable-assert
 | `user_data()` / `user_data(^T)` | The split's user pointer, raw or cast. |
 | `range(n or slice)` | This lane's static share: `(lo, hi)` bounds from a length, `(sub-slice, base index)` from a slice. |
 | `grab(&cursor, n or slice, chunk_size)` | Dynamic chunking off a shared atomic cursor. |
+| `owns(n)` | True on the one lane that owns task `n` (`n % count()`); dispatch independent tasks regardless of lane count. |
 | `sync()` | Barrier across all lanes. |
 | `free_all_temp_allocators()` | Reset every lane's temp arena, main's included — replaces the end-of-frame `free_all`. Once per frame, inside or outside a split. |
 | `broadcast(&value, source := MAIN)` | Copy one lane's variable to all lanes (each gets a snapshot). |

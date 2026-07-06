@@ -432,6 +432,21 @@ scan_custom :: proc "contextless" (value: $T, identity: T, combine: proc "contex
     return;
 }
 
+// True on exactly one lane per n: task n belongs to lane n % count(). For
+// dispatching independent tasks by number without caring how many lanes are
+// actually running — the modulo folds any task count onto any lane count,
+// so the same dispatch code works on 16 lanes, on 2, or serially (where the
+// one lane owns every task):
+//     if lane.owns(0) do step_physics();
+//     if lane.owns(1) do step_audio();
+//     if lane.owns(2) do step_particles();   // folds onto lane 0 with 2 lanes
+// The task number doubles as a stable identity for managing per-task data.
+// lane.is_main() is the same test with the lane chosen for you — it picks
+// the main lane, for work that must run there (equivalent to lane.owns(0)).
+owns :: #force_inline proc "contextless" (n: int) -> bool {
+    return index() == n % count();
+}
+
 // Splits n into ranges of values to be operated onto by the current lane.
 // e.g.: 4 lanes, n = 11:
 // lane 0: lo = 0, hi = 3
