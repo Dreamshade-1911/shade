@@ -45,9 +45,10 @@ SOFTWARE.
 // - Lanes run with the splitter's context; context.allocator must therefore
 //   be thread-safe during a split. temp_allocator and random_generator stay
 //   per-thread.
-// - Collective ops (sync, broadcast, share, reduce, sum, minimum, maximum,
-//   any_of, all_of, scan) must be reached by every lane of the split, in
-//   the same order, or the lanes desync.
+// - Collective ops (sync, broadcast, share, new_once, make_once and their
+//   t- temp variants, reduce, sum, minimum, maximum, any_of, all_of, scan)
+//   must be reached by every lane of the split, in the same order, or the
+//   lanes desync.
 //
 // =========================================================================
 
@@ -276,14 +277,16 @@ sync :: #force_inline proc "contextless" () {
 // Copies a variable on the stack of a source lane to the other lanes.
 // No-op outside a split (the early return also keeps non-lane threads from
 // touching _broadcast while a split is mid-flight).
-// The source index follows the slice bounds-checking contract: validated
-// against the lane count by default, compiled out with -no-bounds-check.
-broadcast :: proc "contextless" (p: ^$T, source_lane_index := MAIN, loc := #caller_location) {
-    runtime.bounds_check_error_loc(loc, source_lane_index, _count);
+// source is a task number, not a lane index: the lane that owns it (see
+// owns) is the one that publishes, so task-numbered code broadcasts from
+// "whoever owns task n" and runs unchanged at any lane count. Negative
+// task numbers are asserted (compiled out with -disable-assert).
+broadcast :: proc "contextless" (p: ^$T, source := MAIN, loc := #caller_location) {
+    assert_contextless(source >= 0, "lane.broadcast source task number must be non-negative.", loc);
     if !_state.active do return;
-    if _state.index == source_lane_index do _broadcast = rawptr(p);
+    if owns(source)  do _broadcast = rawptr(p);
     sync();
-    if _state.index != source_lane_index do p^ = (cast(^T)_broadcast)^;
+    if !owns(source) do p^ = (cast(^T)_broadcast)^;
     sync();
 }
 
@@ -295,11 +298,58 @@ broadcast :: proc "contextless" (p: ^$T, source_lane_index := MAIN, loc := #call
 // frame stays put: close every phase that touches it with lane.sync(), so
 // no lane moves on while another still uses it. Use broadcast instead when
 // each lane should own a snapshot copy.
+// source follows broadcast's task-number contract.
 // Outside a split, returns p unchanged.
-share :: proc "contextless" (p: ^$T, source_lane_index := MAIN, loc := #caller_location) -> ^T {
+share :: proc "contextless" (p: ^$T, source := MAIN, loc := #caller_location) -> ^T {
     q := p;
-    broadcast(&q, source_lane_index, loc);
+    broadcast(&q, source, loc);
     return q;
+}
+
+// new on one lane, everyone gets the pointer: the lane that owns task
+// source allocates a T and broadcasts the pointer, so all lanes alias one
+// heap value. The allocation uses the owning lane's allocator argument
+// (context.allocator by default) — free it with that allocator, on one
+// lane, after a sync. The error contract is new's own (ignorable via
+// #optional_allocator_error), with one addition: the error is broadcast
+// with the pointer, so every lane returns the same one and a failure
+// branch is all-or-nothing — free to contain collectives.
+// Outside a split this is plain new.
+new_once :: proc($T: typeid, source := MAIN, allocator := context.allocator, loc := #caller_location) -> (^T, runtime.Allocator_Error) #optional_allocator_error {
+    r: struct { p: ^T, err: runtime.Allocator_Error };
+    if owns(source) do r.p, r.err = new(T, allocator, loc);
+    broadcast(&r, source, loc);
+    return r.p, r.err;
+}
+
+// new_once on the owning lane's temp arena: shared frame scratch with
+// nothing to free — the end-of-frame free_all_temp_allocators reclaims it.
+tnew_once :: #force_inline proc($T: typeid, source := MAIN, loc := #caller_location) -> (^T, runtime.Allocator_Error) #optional_allocator_error {
+    return new_once(T, source, context.temp_allocator, loc);
+}
+
+// make on one lane, everyone gets the slice: for shared storage whose size
+// is only known mid-split (compaction outputs, per-frame visible lists).
+// Frame-scoped scratch usually wants tmake_once below; with a persistent
+// allocator, delete the slice like new_once's pointer. Only the slice
+// form of make is provided, deliberately: growable containers (map,
+// [dynamic]) cannot be safely grown from several lanes, so sharing one is
+// not a pattern worth sugaring. The error contract is new_once's: make's
+// own, but broadcast, so every lane returns the same error.
+// Outside a split this is plain make.
+make_once :: proc($T: typeid/[]$E, #any_int len: int, source := MAIN, allocator := context.allocator, loc := #caller_location) -> (T, runtime.Allocator_Error) #optional_allocator_error {
+    r: struct { s: T, err: runtime.Allocator_Error };
+    if owns(source) do r.s, r.err = make(T, len, allocator, loc);
+    broadcast(&r, source, loc);
+    return r.s, r.err;
+}
+
+// make_once on the owning lane's temp arena: the shape of most mid-split
+// scratch (sized this frame, dead by the next), so the common case reads
+//     visible := lane.tmake_once([]int, total);
+// with free_all_temp_allocators reclaiming it at end of frame.
+tmake_once :: #force_inline proc($T: typeid/[]$E, #any_int len: int, source := MAIN, loc := #caller_location) -> (T, runtime.Allocator_Error) #optional_allocator_error {
+    return make_once(T, len, source, context.temp_allocator, loc);
 }
 
 // Collectives: combine one value per lane, returning the result to every
@@ -443,6 +493,9 @@ scan_custom :: proc "contextless" (value: $T, identity: T, combine: proc "contex
 // The task number doubles as a stable identity for managing per-task data.
 // lane.is_main() is the same test with the lane chosen for you — it picks
 // the main lane, for work that must run there (equivalent to lane.owns(0)).
+// Collectives with a source parameter (broadcast, share, new_once,
+// make_once) speak the same language: source is a task number, and the
+// lane that owns it publishes.
 owns :: #force_inline proc "contextless" (n: int) -> bool {
     return index() == n % count();
 }
