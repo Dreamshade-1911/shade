@@ -330,27 +330,26 @@ sync :: #force_inline proc "contextless" () {
 // Copies a variable on the stack of a source lane to the other lanes.
 // No-op outside a split (the early return also keeps non-lane threads from
 // touching _broadcast while a split is mid-flight).
-// source is a task number, not a lane index: the lane that owns it (see
-// owns) is the one that publishes, so task-numbered code broadcasts from
-// "whoever owns task n" and runs unchanged at any lane count. Negative
-// task numbers are asserted (compiled out with -disable-assert).
-broadcast :: proc "contextless" (p: ^$T, source := MAIN, loc := #caller_location) {
-    assert_contextless(source >= 0, "lane.broadcast source task number must be non-negative.", loc);
+// source_lane is a lane index, bounds-checked against the lane count
+// (compiled out with -no-bounds-check). For task-numbered dispatch, fold
+// the task onto a lane yourself with task_index, once on entry.
+broadcast :: proc "contextless" (p: ^$T, source_lane := MAIN, loc := #caller_location) {
+    runtime.bounds_check_error_loc(loc, source_lane, _count);
     if !_state.active do return;
     when size_of(T) <= MAX_COLLECTIVE_SIZE {
         // The value rides through the source lane's scratch slot: one
         // barrier, and the source is free to move on immediately.
         bank := _next_bank();
-        if owns(source)  do _slot(T, _state.index, bank)^ = p^;
+        if _state.index == source_lane do _slot(T, source_lane, bank)^ = p^;
         sync();
-        if !owns(source) do p^ = _slot(T, source % _count, bank)^;
+        if _state.index != source_lane do p^ = _slot(T, source_lane, bank)^;
     } else {
         // Too big for a slot: copy straight from the source lane's frame.
         // The trailing sync keeps the source from moving on (and mutating
         // or popping the pointee) while another lane is still copying.
-        if owns(source)  do _broadcast = rawptr(p);
+        if _state.index == source_lane do _broadcast = rawptr(p);
         sync();
-        if !owns(source) do p^ = (cast(^T)_broadcast)^;
+        if _state.index != source_lane do p^ = (cast(^T)_broadcast)^;
         sync();
     }
 }
@@ -363,34 +362,34 @@ broadcast :: proc "contextless" (p: ^$T, source := MAIN, loc := #caller_location
 // frame stays put: close every phase that touches it with lane.sync(), so
 // no lane moves on while another still uses it. Use broadcast instead when
 // each lane should own a snapshot copy.
-// source follows broadcast's task-number contract.
+// source_lane follows broadcast's lane-index contract.
 // Outside a split, returns p unchanged.
-share :: proc "contextless" (p: ^$T, source := MAIN, loc := #caller_location) -> ^T {
+share :: proc "contextless" (p: ^$T, source_lane := MAIN, loc := #caller_location) -> ^T {
     q := p;
-    broadcast(&q, source, loc);
+    broadcast(&q, source_lane, loc);
     return q;
 }
 
-// new on one lane, everyone gets the pointer: the lane that owns task
-// source allocates a T and broadcasts the pointer, so all lanes alias one
-// heap value. The allocation uses the owning lane's allocator argument
+// new on one lane, everyone gets the pointer: lane source_lane allocates a
+// T and broadcasts the pointer, so all lanes alias one heap value. The
+// allocation uses the source lane's allocator argument
 // (context.allocator by default), free it with that allocator, on one
 // lane, after a sync. The error contract is new's own (ignorable via
 // #optional_allocator_error), with one addition: the error is broadcast
 // with the pointer, so every lane returns the same one and a failure
 // branch is all-or-nothing, free to contain collectives.
 // Outside a split this is plain new.
-new_once :: proc($T: typeid, source := MAIN, allocator := context.allocator, loc := #caller_location) -> (^T, runtime.Allocator_Error) #optional_allocator_error {
+new_once :: proc($T: typeid, source_lane := MAIN, allocator := context.allocator, loc := #caller_location) -> (^T, runtime.Allocator_Error) #optional_allocator_error {
     r: struct { p: ^T, err: runtime.Allocator_Error };
-    if owns(source) do r.p, r.err = new(T, allocator, loc);
-    broadcast(&r, source, loc);
+    if index() == source_lane do r.p, r.err = new(T, allocator, loc);
+    broadcast(&r, source_lane, loc);
     return r.p, r.err;
 }
 
-// new_once on the owning lane's temp arena: shared frame scratch with
+// new_once on the source lane's temp arena: shared frame scratch with
 // nothing to free, the end-of-frame free_all_temp_allocators reclaims it.
-tnew_once :: #force_inline proc($T: typeid, source := MAIN, loc := #caller_location) -> (^T, runtime.Allocator_Error) #optional_allocator_error {
-    return new_once(T, source, context.temp_allocator, loc);
+tnew_once :: #force_inline proc($T: typeid, source_lane := MAIN, loc := #caller_location) -> (^T, runtime.Allocator_Error) #optional_allocator_error {
+    return new_once(T, source_lane, context.temp_allocator, loc);
 }
 
 // make on one lane, everyone gets the slice: for shared storage whose size
@@ -402,19 +401,19 @@ tnew_once :: #force_inline proc($T: typeid, source := MAIN, loc := #caller_locat
 // not a pattern worth sugaring. The error contract is new_once's: make's
 // own, but broadcast, so every lane returns the same error.
 // Outside a split this is plain make.
-make_once :: proc($T: typeid/[]$E, #any_int len: int, source := MAIN, allocator := context.allocator, loc := #caller_location) -> (T, runtime.Allocator_Error) #optional_allocator_error {
+make_once :: proc($T: typeid/[]$E, #any_int len: int, source_lane := MAIN, allocator := context.allocator, loc := #caller_location) -> (T, runtime.Allocator_Error) #optional_allocator_error {
     r: struct { s: T, err: runtime.Allocator_Error };
-    if owns(source) do r.s, r.err = make(T, len, allocator, loc);
-    broadcast(&r, source, loc);
+    if index() == source_lane do r.s, r.err = make(T, len, allocator, loc);
+    broadcast(&r, source_lane, loc);
     return r.s, r.err;
 }
 
-// make_once on the owning lane's temp arena: the shape of most mid-split
+// make_once on the source lane's temp arena: the shape of most mid-split
 // scratch (sized this frame, dead by the next), so the common case reads
 //     visible := lane.tmake_once([]int, total);
 // with free_all_temp_allocators reclaiming it at end of frame.
-tmake_once :: #force_inline proc($T: typeid/[]$E, #any_int len: int, source := MAIN, loc := #caller_location) -> (T, runtime.Allocator_Error) #optional_allocator_error {
-    return make_once(T, len, source, context.temp_allocator, loc);
+tmake_once :: #force_inline proc($T: typeid/[]$E, #any_int len: int, source_lane := MAIN, loc := #caller_location) -> (T, runtime.Allocator_Error) #optional_allocator_error {
+    return make_once(T, len, source_lane, context.temp_allocator, loc);
 }
 
 // Collectives: combine one value per lane, returning the result to every
@@ -559,22 +558,20 @@ scan_custom :: proc "contextless" (value: $T, identity: T, combine: proc "contex
     return;
 }
 
-// True on exactly one lane per n: task n belongs to lane n % count(). For
-// dispatching independent tasks by number without caring how many lanes are
-// actually running, the modulo folds any task count onto any lane count,
-// so the same dispatch code works on 16 lanes, on 2, or serially (where the
-// one lane owns every task):
-//     if lane.owns(0) do step_physics();
-//     if lane.owns(1) do step_audio();
-//     if lane.owns(2) do step_particles();   // folds onto lane 0 with 2 lanes
+// The lane that task n folds onto: n % count(). For dispatching independent
+// tasks by number without caring how many lanes are actually running, the
+// modulo folds any task count onto any lane count, so the same dispatch
+// code works on 16 lanes, on 2, or serially (where lane 0 gets every task):
+//     me := lane.index();
+//     if me == lane.task_index(0) do step_physics();
+//     if me == lane.task_index(1) do step_audio();
+//     if me == lane.task_index(2) do step_particles();   // lane 0 with 2 lanes
 // The task number doubles as a stable identity for managing per-task data.
-// lane.is_main() is the same test with the lane chosen for you, it picks
-// the main lane, for work that must run there (equivalent to lane.owns(0)).
-// Collectives with a source parameter (broadcast, share, new_once,
-// make_once) speak the same language: source is a task number, and the
-// lane that owns it publishes.
-owns :: #force_inline proc "contextless" (n: int) -> bool {
-    return index() == n % count();
+// Collectives with a source_lane parameter (broadcast, share, new_once,
+// make_once) take a plain lane index; pass task_index(n) to publish from
+// whoever gets task n.
+task_index :: #force_inline proc "contextless" (n: int) -> int {
+    return n % count();
 }
 
 // Splits n into ranges of values to be operated onto by the current lane.

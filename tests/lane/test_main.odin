@@ -31,7 +31,7 @@ Case :: struct {
 CASES :: []Case {
     { "smoke",             .Ok,   "normal use: 200 splits, re-init, 1-lane mode, serial fallback" },
     { "grab",              .Ok,   "dynamic chunking: every index covered exactly once, ragged chunks, n=0, serial use" },
-    { "owns",              .Ok,   "task dispatch: every task owned exactly once, by lane n % count, serial fallback" },
+    { "task_index",        .Ok,   "task dispatch: every task folds onto exactly one lane, n % count, serial fallback" },
     { "once",              .Ok,   "new_once/make_once and t- variants: one allocation aliased by all lanes, task-numbered source, uniform allocation error, serial fallback" },
     { "collectives",       .Ok,   "reduce/sum/minimum/maximum/any_of/all_of/scan: fold order, vectors, compaction, serial degrade" },
     { "nested_split",      .Die,  "lane.split from inside a split (main lane)" },
@@ -43,7 +43,7 @@ CASES :: []Case {
     { "double_init_1lane", .Die,  "lane.init(1) called twice (0-len _threads slice used to dodge the old guard)" },
     { "split_before_init", .Die,  "lane.split before lane.init" },
     { "divergent_sync",    .Hang, "one lane skips a lane.sync: barrier deadlock, inherent to barrier misuse" },
-    { "broadcast_bad_src", .Die,  "broadcast with a negative source task number: asserted" },
+    { "broadcast_bad_src", .Die,  "broadcast with an out-of-range source lane index: bounds-checked" },
 };
 
 CHILD_TIMEOUT :: 3 * time.Second;
@@ -112,7 +112,7 @@ run_case :: proc(name: string) {
     switch name {
     case "smoke":             case_smoke();
     case "grab":              case_grab();
-    case "owns":              case_owns();
+    case "task_index":        case_task_index();
     case "once":              case_once();
     case "collectives":       case_collectives();
     case "nested_split":      case_nested_split();
@@ -134,30 +134,31 @@ run_case :: proc(name: string) {
 
 // ---------------------------------------------------------------- positive
 
-owns_work :: proc() {
-    // Owned task numbers are disjoint across lanes, so these writes don't race.
+task_index_work :: proc() {
+    // Each task folds onto one lane, so these writes don't race.
+    me := lane.index();
     for i in 0 ..< N {
-        if lane.owns(i) {
-            assert(lane.index() == i % lane.count(), "owns picked the wrong lane");
+        if me == lane.task_index(i) {
+            assert(me == i % lane.count(), "task_index picked the wrong lane");
             _seen[i] += 1;
         }
     }
-    // Task 0 belongs to lane 0, so owns(0) is is_main.
-    assert(lane.owns(0) == lane.is_main(), "owns(0) must match is_main");
+    // Task 0 folds onto lane 0, so its test matches is_main.
+    assert((me == lane.task_index(0)) == lane.is_main(), "task_index(0) must match is_main");
 }
 
-case_owns :: proc() {
+case_task_index :: proc() {
     lane.init(4);
 
-    // Every task owned exactly once, by lane i % count.
+    // Every task handled exactly once, by lane i % count.
     for i in 0 ..< N do _seen[i] = 0;
-    lane.split(owns_work);
-    for i in 0 ..< N do assert(_seen[i] == 1, "task unowned or owned twice");
+    lane.split(task_index_work);
+    for i in 0 ..< N do assert(_seen[i] == 1, "task unhandled or handled twice");
 
     lane.deinit();
 
-    // Serial fallback: one lane owns every task.
-    for i in 0 ..< N do assert(lane.owns(i), "serial owns must own everything");
+    // Serial fallback: every task folds onto lane 0.
+    for i in 0 ..< N do assert(lane.task_index(i) == 0, "serial task_index must fold onto lane 0");
 }
 
 once_work :: proc() {
@@ -167,9 +168,10 @@ once_work :: proc() {
     lane.sync();
     assert(p^ == 123, "new_once pointer not shared");
 
-    // Task-numbered source: allocated by whoever owns task 7 (lane 3 of 4).
-    q := lane.new_once(int, 7);
-    if lane.owns(7) do q^ = 7;
+    // Task-numbered source, folded by the caller: task 7 is lane 3 of 4.
+    src := lane.task_index(7);
+    q := lane.new_once(int, src);
+    if lane.index() == src do q^ = 7;
     lane.sync();
     assert(q^ == 7, "new_once task-numbered source wrong");
 
@@ -187,9 +189,9 @@ once_work :: proc() {
         delete(s);
     }
 
-    // Temp variants: same sharing, on the owning lane's temp arena.
+    // Temp variants: same sharing, on the source lane's temp arena.
     tp := lane.tnew_once(int, 2);
-    if lane.owns(2) do tp^ = 55;
+    if lane.index() == 2 do tp^ = 55;
     lane.sync();
     assert(tp^ == 55, "tnew_once pointer not shared");
     ts := lane.tmake_once([]int, 4);
@@ -201,7 +203,8 @@ once_work :: proc() {
 
     // The allocation error is broadcast with the result: even though only
     // the owning lane called the allocator, every lane returns the same
-    // error, so the failure branch is all-or-nothing.
+    // error, so the failure branch is all-or-nothing (only the source lane
+    // called the allocator).
     oom := runtime.Allocator { procedure = failing_allocator_proc };
     bad, err := lane.new_once(int, allocator = oom);
     assert(bad == nil && err == .Out_Of_Memory, "new_once must broadcast the allocation error");
@@ -220,8 +223,9 @@ case_once :: proc() {
     lane.split(once_work);
     lane.deinit();
 
-    // Serial fallback: plain new/make, any non-negative task number.
-    p := lane.new_once(int, 5);
+    // Serial fallback: plain new/make. Task numbers must be folded by the
+    // caller; task_index(5) is lane 0 when serial.
+    p := lane.new_once(int, lane.task_index(5));
     p^ = 5;
     assert(p^ == 5, "serial new_once broken");
     free(p);
@@ -351,11 +355,12 @@ collectives_work :: proc() {
     pmax, tmax := lane.scan(idx, -1, proc "contextless" (a, b: int) -> int { return max(a, b); });
     assert(pmax == idx - 1 && tmax == 3, "scan_custom wrong");
 
-    // broadcast's source is a task number: 99 folds onto lane 99 % 4 == 3.
+    // Task-numbered broadcast, folded by the caller: 99 % 4 == lane 3.
     fold := 0;
-    if lane.owns(99) do fold = 4242;
-    lane.broadcast(&fold, 99);
-    assert(fold == 4242, "broadcast task-number source did not fold onto the owning lane");
+    fold_src := lane.task_index(99);
+    if idx == fold_src do fold = 4242;
+    lane.broadcast(&fold, fold_src);
+    assert(fold == 4242, "broadcast from task_index(99) did not come from lane 3");
 
     // Compaction: lane i writes i+1 copies of its index at its offset.
     for j in 0 ..< idx + 1 do _compact[offset + j] = idx;
@@ -536,7 +541,7 @@ case_divergent_sync :: proc() {
 
 bad_broadcast_work :: proc() {
     x := 0;
-    lane.broadcast(&x, -1); // Negative task numbers own no lane: asserted.
+    lane.broadcast(&x, -1); // Not a lane index: bounds-checked.
 }
 
 case_broadcast_bad_src :: proc() {

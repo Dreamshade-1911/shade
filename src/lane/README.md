@@ -45,13 +45,13 @@ update_entities :: proc() {
 | `user_data()` / `user_data(^T)` | The split's user pointer, raw or cast. |
 | `range(n or slice)` | This lane's static share: `(lo, hi)` bounds from a length, `(sub-slice, base index)` from a slice. |
 | `grab(&cursor, n or slice, chunk_size)` | Dynamic chunking off a shared atomic cursor. |
-| `owns(n)` | True on the one lane that owns task `n` (`n % count()`); dispatch independent tasks regardless of lane count. |
+| `task_index(n)` | The lane that task `n` folds onto (`n % count()`); compare with `index()` to dispatch independent tasks regardless of lane count. |
 | `sync()` | Barrier across all lanes. |
 | `free_all_temp_allocators()` | Reset every lane's temp arena, main's included — replaces the end-of-frame `free_all`. Once per frame, inside or outside a split. |
-| `broadcast(&value, source := MAIN)` | Copy one lane's variable to all lanes (each gets a snapshot). `source` is a task number: the owning lane publishes. |
+| `broadcast(&value, source := MAIN)` | Copy one lane's variable to all lanes (each gets a snapshot). `source` is a lane index; pass `task_index(n)` for task-numbered dispatch. |
 | `share(&value, source := MAIN) -> ^T` | Pointer to the source lane's stack variable on every lane; pin it with `sync` per phase. |
-| `new_once(T, ...)` / `make_once([]T, len, ...)` | Allocate on the owning lane, alias on every lane; the `Allocator_Error` is broadcast too (same on every lane, ignorable). Free on one lane, after a sync. |
-| `tnew_once(T, ...)` / `tmake_once([]T, len, ...)` | The same, on the owning lane's temp arena — nothing to free, `free_all_temp_allocators` reclaims it. |
+| `new_once(T, ...)` / `make_once([]T, len, ...)` | Allocate on the source lane, alias on every lane; the `Allocator_Error` is broadcast too (same on every lane, ignorable). Free on one lane, after a sync. |
+| `tnew_once(T, ...)` / `tmake_once([]T, len, ...)` | The same, on the source lane's temp arena — nothing to free, `free_all_temp_allocators` reclaims it. |
 | `sum` / `minimum` / `maximum` / `any_of` / `all_of` | Common reductions; result on every lane. |
 | `reduce(value, combine)` | Custom reduction, deterministic left-fold in lane order. |
 | `scan(value)` / `scan(value, identity, combine)` | Exclusive prefix sum/fold; returns `(offset/prefix, total)`. |
@@ -76,7 +76,7 @@ Misuse fails the way the rest of Odin fails, and the test suite (`test.bat lane`
 | Misuse | Result |
 |---|---|
 | `split`/`init` misuse (before init, twice, nested, concurrent), `deinit` inside a split | `assert` with a clear message; compiled out by `-disable-assert` |
-| A negative `source` task number (`broadcast`/`share`/`new_once`/`make_once`) | `assert` at the caller's line; any non-negative task number is valid — it folds onto a lane (`% count()`) |
+| An out-of-range `source` lane index (`broadcast`/`share`/`new_once`/`make_once`) | Bounds check at the caller's line, like any array index; fold task numbers into range with `task_index(n)` |
 | A lane skips a `sync`/collective the others reach | Deadlock — inherent to barriers, cannot be checked cheaply |
 
 Debug builds keep every check; the release target (`-disable-assert -no-bounds-check`) strips them all.
@@ -123,15 +123,16 @@ for chunk, lo in lane.grab(&cursor, items, 16) { ... }  // chunk[j] is items[lo 
 
 Pick the chunk size so that a chunk is meaningful work (hundreds of cycles at least); tiny chunks turn the cursor into a contention point.
 
-**`owns` — dispatching tasks by number.** Where `range` and `grab` split a loop, `lane.owns(n)` hands out whole tasks: it is true on exactly one lane, the one that owns task `n` (`n % count()`). Number the tasks you know are independent and dispatch them without caring how many lanes are actually running — the modulo folds any task count onto any lane count, so the same code works on 16 lanes, on 2, or serially (where the one lane owns every task):
+**`task_index` — dispatching tasks by number.** Where `range` and `grab` split a loop, `lane.task_index(n)` hands out whole tasks: it returns the lane that task `n` folds onto (`n % count()`). Number the tasks you know are independent and dispatch them without caring how many lanes are actually running — the modulo folds any task count onto any lane count, so the same code works on 16 lanes, on 2, or serially (where lane 0 gets every task):
 
 ```odin
-if lane.owns(0) do step_physics();
-if lane.owns(1) do step_audio();
-if lane.owns(2) do step_particles();   // folds onto lane 0 with 2 lanes
+me := lane.index();
+if me == lane.task_index(0) do step_physics();
+if me == lane.task_index(1) do step_audio();
+if me == lane.task_index(2) do step_particles();   // lane 0 with 2 lanes
 ```
 
-The task number doubles as a stable identity for managing per-task data. `lane.is_main()` is the same test with the lane chosen for you — it picks the main lane, for work that must run there like main-thread-only APIs (equivalent to `lane.owns(0)`). Collectives with a source parameter (`broadcast`, `share`, `new_once`, `make_once`) speak the same language: `source` is a task number, and the lane that owns it publishes.
+The task number doubles as a stable identity for managing per-task data. `lane.is_main()` covers the common case of work that must run on the main lane, like main-thread-only APIs. Collectives with a source parameter (`broadcast`, `share`, `new_once`, `make_once`) take a plain lane index: pass `task_index(n)` to publish from whoever gets task `n`.
 
 ---
 
@@ -185,14 +186,13 @@ tick :: proc() {
 }
 ```
 
-The source defaults to `lane.MAIN` and is a *task number*, not a lane index: the lane that owns it (`source % count()`, see [`owns`](#distributing-work)) is the one that publishes. Task-numbered code can therefore broadcast from "whoever owns task `n`" and run unchanged at any lane count:
+The source defaults to `lane.MAIN` and is a plain lane index, bounds-checked like any array index (see [Failure contract](#failure-contract)). For task-numbered dispatch, fold the task onto a lane once with [`task_index`](#distributing-work) and use the result for both the work and the broadcast:
 
 ```odin
-if lane.owns(3) do result = compute();   // whoever owns task 3
-lane.broadcast(&result, 3);              // ...is also the broadcast source
+src := lane.task_index(3);                       // whoever gets task 3
+if lane.index() == src do result = compute();
+lane.broadcast(&result, src);                    // ...is also the broadcast source
 ```
-
-Negative task numbers are asserted (see [Failure contract](#failure-contract)).
 
 **`share`** hands out a pointer instead of a copy: every lane receives the same pointer into the *source lane's stack*, which becomes the single home of a piece of mutable shared state — a `grab` cursor, a shared accumulator, the header of a shared output list:
 
@@ -215,7 +215,7 @@ visible := lane.tmake_once([]int, total);
 copy(visible[offset:][:n_visible], visible_local[:n_visible]);
 ```
 
-The allocation happens on the lane that owns `source` (default `MAIN`), with that lane's `allocator` argument — so it must be freed with that allocator, by one lane, after a sync. **`tnew_once` / `tmake_once`** are the same procs with the allocator pinned to the owning lane's `context.temp_allocator`, and they are the common case, as above: frame-scoped shared scratch with no freeing question at all — the end-of-frame `free_all_temp_allocators` reclaims it.
+The allocation happens on lane `source` (default `MAIN`), with that lane's `allocator` argument — so it must be freed with that allocator, by one lane, after a sync. **`tnew_once` / `tmake_once`** are the same procs with the allocator pinned to the source lane's `context.temp_allocator`, and they are the common case, as above: frame-scoped shared scratch with no freeing question at all — the end-of-frame `free_all_temp_allocators` reclaims it.
 
 The error contract is `new`/`make`'s own — an ignorable `Allocator_Error` (`#optional_allocator_error`) — with one addition: the error is broadcast along with the result, so **every lane returns the same error**. An error only one lane could see would be a divergent branch waiting to happen; because all lanes agree, the failure branch is all-or-nothing and may freely contain syncs and collectives:
 
