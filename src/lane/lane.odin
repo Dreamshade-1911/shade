@@ -176,15 +176,12 @@ when LANE_FAST_BARRIER {
 
 
 // thread_count is the total number of lanes, including the calling thread.
-// Non-positive values are relative to the logical core count: 0 means one
-// lane per core, -n means all cores but n (for leaving cores free for
-// dedicated threads). Always clamped to at least 1 lane.
+// 0 = core count.
 init :: proc(thread_count := 0) {
     assert(!_live, "lane.init called twice.");
-    lc := thread_count;
-    if lc <= 0 do lc += os.get_processor_core_count();
-    lc = max(lc, 1);
+    assert(thread_count >= 0, "init's thread_count cannot be negative.");
 
+    lc := os.get_processor_core_count() if thread_count == 0 else thread_count;
     _count = lc;
     _go = 0;
     _live = true;
@@ -308,8 +305,11 @@ _worker :: proc(t: ^thread.Thread) {
     }
 }
 
+// Current lane's index.
 index     :: #force_inline proc "contextless" () -> int  { return _state.index }
+// Total lane count (fixed after `init`).
 count     :: #force_inline proc "contextless" () -> int  { return _count if _state.active else 1 }
+// Is the main thread's lane? (same as `lane.index() == 0`).
 is_main   :: #force_inline proc "contextless" () -> bool { return _state.index == MAIN }
 
 // Total lane count as configured at init, valid outside splits too.
@@ -332,7 +332,7 @@ sync :: #force_inline proc "contextless" () {
 // touching _broadcast while a split is mid-flight).
 // source_lane is a lane index, bounds-checked against the lane count
 // (compiled out with -no-bounds-check). For task-numbered dispatch, fold
-// the task onto a lane yourself with task_index, once on entry.
+// the task onto a lane yourself with is_task_lane(), once on entry.
 broadcast :: proc "contextless" (p: ^$T, source_lane := MAIN, loc := #caller_location) {
     runtime.bounds_check_error_loc(loc, source_lane, _count);
     if !_state.active do return;
@@ -558,20 +558,17 @@ scan_custom :: proc "contextless" (value: $T, identity: T, combine: proc "contex
     return;
 }
 
-// The lane that task n folds onto: n % count(). For dispatching independent
-// tasks by number without caring how many lanes are actually running, the
-// modulo folds any task count onto any lane count, so the same dispatch
-// code works on 16 lanes, on 2, or serially (where lane 0 gets every task):
-//     me := lane.index();
-//     if me == lane.task_index(0) do step_physics();
-//     if me == lane.task_index(1) do step_audio();
-//     if me == lane.task_index(2) do step_particles();   // lane 0 with 2 lanes
-// The task number doubles as a stable identity for managing per-task data.
-// Collectives with a source_lane parameter (broadcast, share, new_once,
-// make_once) take a plain lane index; pass task_index(n) to publish from
-// whoever gets task n.
-task_index :: #force_inline proc "contextless" (n: int) -> int {
+// Utility proc for `n % count()`.
+task_lane :: #force_inline proc "contextless" (n: int) -> int {
     return n % count();
+}
+
+// Utility proc for `lane.index() == task_lane(n)`.
+//     if lane.is_task_lane(0) do init_physics();
+//     if lane.is_task_lane(1) do init_audio();
+//     if lane.is_task_lane(2) do init_particles();   // lane 0 with 2 lanes
+is_task_lane :: #force_inline proc "contextless" (n: int) -> bool {
+    return _state.index == n % count();
 }
 
 // Splits n into ranges of values to be operated onto by the current lane.

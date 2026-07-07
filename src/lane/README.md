@@ -27,7 +27,7 @@ update_entities :: proc() {
 
 ## The model
 
-- **Lanes are fixed.** `lane.init(thread_count)` creates `thread_count` lanes. Non-positive counts are relative to the logical core count: `0` = one lane per core, `-n` = all cores but `n` — e.g. `lane.init(-2)` leaves two cores free for dedicated threads (audio, streaming). Always clamped to at least one lane. The calling thread is always lane `lane.MAIN` (`0`) in every split; worker `i` is always lane `i`, for the whole program. Per-lane data (scratch arenas, RNG streams, profiler slots) can therefore be indexed by `lane.index()` and allocated once, sized with `lane.capacity()`.
+- **Lanes are fixed.** `lane.init(thread_count)` creates `thread_count` lanes, with a value of 0 = `os.processor_core_count`. The calling thread is always lane `lane.MAIN` (`0`) in every split; worker `i` is always lane `i`, for the whole program. Per-lane data (scratch arenas, RNG streams, profiler slots) can therefore be indexed by `lane.index()` and allocated once, sized with `lane.capacity()`.
 - **The splitter participates.** `lane.split(p)` runs `p` on all lanes, including the caller, and returns when every lane has finished. Because the caller is always lane `MAIN`, main-thread-only APIs (SDL event pump, etc.) work inside a split behind `if lane.is_main()`.
 - **Serial code is the degenerate case, by construction.** Outside a split, `count()` is `1` and `index()` is `0`, so `range(n)` covers everything, `sync()`/`broadcast()` are no-ops, and every collective returns its input. The same proc runs correctly SPMD, serially, and under `lane.init(1)` (single-threaded mode, useful for debugging and platforms where you want the engine on one core — with a constant `1` most of it optimizes away).
 
@@ -37,7 +37,7 @@ update_entities :: proc() {
 
 | Proc | Purpose |
 |---|---|
-| `init(thread_count := 0)` | Spawn the gang; `0` = logical core count, `-n` = all cores but `n`. |
+| `init(thread_count := 0)` | Spawn the gang; `0` = logical core count. |
 | `deinit()` | Join and free the gang. |
 | `split(p: Proc, user_data: rawptr = nil)` | Run `p` on every lane; returns when all finish. |
 | `index()` / `count()` / `is_main()` | This lane's identity. Serial: `0` / `1` / `true`. |
@@ -45,7 +45,8 @@ update_entities :: proc() {
 | `user_data()` / `user_data(^T)` | The split's user pointer, raw or cast. |
 | `range(n or slice)` | This lane's static share: `(lo, hi)` bounds from a length, `(sub-slice, base index)` from a slice. |
 | `grab(&cursor, n or slice, chunk_size)` | Dynamic chunking off a shared atomic cursor. |
-| `task_index(n)` | The lane that task `n` folds onto (`n % count()`); compare with `index()` to dispatch independent tasks regardless of lane count. |
+| `task_lane(n)` | The lane that task `n` folds onto (`n % count()`). |
+| `is_task_lane(n)` | Returns comparison with current lane's index with `task_lane(n)`, same as `lane.index() == lane.task_lane(n)`. |
 | `sync()` | Barrier across all lanes. |
 | `free_all_temp_allocators()` | Reset every lane's temp arena, main's included — replaces the end-of-frame `free_all`. Once per frame, inside or outside a split. |
 | `broadcast(&value, source := MAIN)` | Copy one lane's variable to all lanes (each gets a snapshot). `source` is a lane index; pass `task_index(n)` for task-numbered dispatch. |
