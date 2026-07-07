@@ -332,7 +332,7 @@ sync :: #force_inline proc "contextless" () {
 // touching _broadcast while a split is mid-flight).
 // source_lane is a lane index, bounds-checked against the lane count
 // (compiled out with -no-bounds-check). For task-numbered dispatch, fold
-// the task onto a lane yourself with is_task_lane(), once on entry.
+// the task onto a lane yourself with task_lane().
 broadcast :: proc "contextless" (p: ^$T, source_lane := MAIN, loc := #caller_location) {
     runtime.bounds_check_error_loc(loc, source_lane, _count);
     if !_state.active do return;

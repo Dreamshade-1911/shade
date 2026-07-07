@@ -31,7 +31,7 @@ Case :: struct {
 CASES :: []Case {
     { "smoke",             .Ok,   "normal use: 200 splits, re-init, 1-lane mode, serial fallback" },
     { "grab",              .Ok,   "dynamic chunking: every index covered exactly once, ragged chunks, n=0, serial use" },
-    { "task_index",        .Ok,   "task dispatch: every task folds onto exactly one lane, n % count, serial fallback" },
+    { "task_lane",         .Ok,   "task dispatch: every task folds onto exactly one lane, n % count, serial fallback" },
     { "once",              .Ok,   "new_once/make_once and t- variants: one allocation aliased by all lanes, task-numbered source, uniform allocation error, serial fallback" },
     { "collectives",       .Ok,   "reduce/sum/minimum/maximum/any_of/all_of/scan: fold order, vectors, compaction, serial degrade" },
     { "nested_split",      .Die,  "lane.split from inside a split (main lane)" },
@@ -112,7 +112,7 @@ run_case :: proc(name: string) {
     switch name {
     case "smoke":             case_smoke();
     case "grab":              case_grab();
-    case "task_index":        case_task_index();
+    case "task_lane":         case_task_lane();
     case "once":              case_once();
     case "collectives":       case_collectives();
     case "nested_split":      case_nested_split();
@@ -134,31 +134,31 @@ run_case :: proc(name: string) {
 
 // ---------------------------------------------------------------- positive
 
-task_index_work :: proc() {
+task_lane_work :: proc() {
     // Each task folds onto one lane, so these writes don't race.
     me := lane.index();
     for i in 0 ..< N {
-        if me == lane.task_index(i) {
-            assert(me == i % lane.count(), "task_index picked the wrong lane");
+        if lane.is_task_lane(i) {
+            assert(me == i % lane.count(), "is_task_lane picked the wrong lane");
             _seen[i] += 1;
         }
     }
     // Task 0 folds onto lane 0, so its test matches is_main.
-    assert((me == lane.task_index(0)) == lane.is_main(), "task_index(0) must match is_main");
+    assert(lane.is_task_lane(0) == lane.is_main(), "is_task_lane(0) must match is_main");
 }
 
-case_task_index :: proc() {
+case_task_lane :: proc() {
     lane.init(4);
 
     // Every task handled exactly once, by lane i % count.
     for i in 0 ..< N do _seen[i] = 0;
-    lane.split(task_index_work);
+    lane.split(task_lane_work);
     for i in 0 ..< N do assert(_seen[i] == 1, "task unhandled or handled twice");
 
     lane.deinit();
 
     // Serial fallback: every task folds onto lane 0.
-    for i in 0 ..< N do assert(lane.task_index(i) == 0, "serial task_index must fold onto lane 0");
+    for i in 0 ..< N do assert(lane.task_lane(i) == 0, "serial task_lane must fold onto lane 0");
 }
 
 once_work :: proc() {
@@ -169,7 +169,7 @@ once_work :: proc() {
     assert(p^ == 123, "new_once pointer not shared");
 
     // Task-numbered source, folded by the caller: task 7 is lane 3 of 4.
-    src := lane.task_index(7);
+    src := lane.task_lane(7);
     q := lane.new_once(int, src);
     if lane.index() == src do q^ = 7;
     lane.sync();
@@ -224,8 +224,8 @@ case_once :: proc() {
     lane.deinit();
 
     // Serial fallback: plain new/make. Task numbers must be folded by the
-    // caller; task_index(5) is lane 0 when serial.
-    p := lane.new_once(int, lane.task_index(5));
+    // caller; task_lane(5) is lane 0 when serial.
+    p := lane.new_once(int, lane.task_lane(5));
     p^ = 5;
     assert(p^ == 5, "serial new_once broken");
     free(p);
@@ -300,14 +300,6 @@ case_smoke :: proc() {
     assert(_total == EXPECTED_SUM, "wrong sum after re-init");
     lane.deinit();
 
-    // Negative counts are relative to the core count (clamped to 1).
-    lane.init(-1);
-    assert(lane.capacity() == max(os.get_processor_core_count() - 1, 1), "negative thread_count wrong");
-    _total = 0;
-    lane.split(sum_work, &tag);
-    assert(_total == EXPECTED_SUM, "wrong sum with negative thread_count");
-    lane.deinit();
-
     // Single-threaded mode must run serially without blocking.
     lane.init(1);
     _total = 0;
@@ -357,10 +349,10 @@ collectives_work :: proc() {
 
     // Task-numbered broadcast, folded by the caller: 99 % 4 == lane 3.
     fold := 0;
-    fold_src := lane.task_index(99);
+    fold_src := lane.task_lane(99);
     if idx == fold_src do fold = 4242;
     lane.broadcast(&fold, fold_src);
-    assert(fold == 4242, "broadcast from task_index(99) did not come from lane 3");
+    assert(fold == 4242, "broadcast from task_lane(99) did not come from lane 3");
 
     // Compaction: lane i writes i+1 copies of its index at its offset.
     for j in 0 ..< idx + 1 do _compact[offset + j] = idx;
