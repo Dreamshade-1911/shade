@@ -9,11 +9,25 @@ rest.
 Every library lives under `src/` as its own package and is documented by a
 `README.md` next to the code.
 
+---
+
 ## Libraries
 
 | Library | Description |
 |---|---|
 | [`lane`](src/lane) | SPMD "run the same proc on every core" parallelism over fixed persistent threads, ISPC-style lanes. |
+
+---
+
+## Examples
+
+Runnable demos live under `examples/`, each with its own `README.md`:
+
+| Example | Description | Libraries used |
+|---|---|---|
+| [`galaxy`](examples/galaxy) | Interactive N-body galaxy: an O(n²) gravity sim running SPMD on all cores with a SIMD inner loop, drawn with SDL_gpu. | [`lane`](src/lane) |
+
+---
 
 ## Usage
 
@@ -34,6 +48,8 @@ main :: proc() {
 ```
 
 Each library's `README.md` covers its API and usage.
+
+---
 
 ## License
 

@@ -23,11 +23,15 @@ update_entities :: proc() {
 }
 ```
 
+---
+
 ## The model
 
 - **Lanes are fixed.** `lane.init(thread_count)` creates `thread_count` lanes. Non-positive counts are relative to the logical core count: `0` = one lane per core, `-n` = all cores but `n` — e.g. `lane.init(-2)` leaves two cores free for dedicated threads (audio, streaming). Always clamped to at least one lane. The calling thread is always lane `lane.MAIN` (`0`) in every split; worker `i` is always lane `i`, for the whole program. Per-lane data (scratch arenas, RNG streams, profiler slots) can therefore be indexed by `lane.index()` and allocated once, sized with `lane.capacity()`.
 - **The splitter participates.** `lane.split(p)` runs `p` on all lanes, including the caller, and returns when every lane has finished. Because the caller is always lane `MAIN`, main-thread-only APIs (SDL event pump, etc.) work inside a split behind `if lane.is_main()`.
 - **Serial code is the degenerate case, by construction.** Outside a split, `count()` is `1` and `index()` is `0`, so `range(n)` covers everything, `sync()`/`broadcast()` are no-ops, and every collective returns its input. The same proc runs correctly SPMD, serially, and under `lane.init(1)` (single-threaded mode, useful for debugging and platforms where you want the engine on one core — with a constant `1` most of it optimizes away).
+
+---
 
 ## API summary
 
@@ -53,6 +57,8 @@ update_entities :: proc() {
 | `scan(value)` / `scan(value, identity, combine)` | Exclusive prefix sum/fold; returns `(offset/prefix, total)`. |
 | `MAIN`, `Proc`, `MAX_COLLECTIVE_SIZE` | Lane 0's index; the split proc type; collective value size limit in bytes — `-define:LANE_MAX_COLLECTIVE_SIZE` (power of two; defaults to the target's cache line: 64, or 128 on Apple Silicon). |
 
+---
+
 ## Rules
 
 1. **`init` first, `deinit` last.** The lane count is fixed in between.
@@ -60,6 +66,8 @@ update_entities :: proc() {
 3. **Lanes run with the splitter's `context`**, so `context.allocator` must be thread-safe during a split (the default heap allocator is). Each lane keeps its *own* `temp_allocator` and `random_generator` — free per-lane scratch, but also the reason a value temp-allocated by one lane must not be freed by another, and why each lane must `free_all` its own arena — `lane.free_all_temp_allocators()` once per frame does it for all of them (see the culling example).
 4. **Collectives are collective.** Every lane, every collective, same order (see [Synchronizing](#synchronizing-sync)).
 5. Threads that are not lanes (e.g. a dedicated audio thread) may call any of the query/collective procs safely: they see the serial behavior. They may not call `split`.
+
+---
 
 ## Failure contract
 
@@ -72,6 +80,8 @@ Misuse fails the way the rest of Odin fails, and the test suite (`test.bat lane`
 | A lane skips a `sync`/collective the others reach | Deadlock — inherent to barriers, cannot be checked cheaply |
 
 Debug builds keep every check; the release target (`-disable-assert -no-bounds-check`) strips them all.
+
+---
 
 ## Distributing work
 
@@ -123,6 +133,8 @@ if lane.owns(2) do step_particles();   // folds onto lane 0 with 2 lanes
 
 The task number doubles as a stable identity for managing per-task data. `lane.is_main()` is the same test with the lane chosen for you — it picks the main lane, for work that must run there like main-thread-only APIs (equivalent to `lane.owns(0)`). Collectives with a source parameter (`broadcast`, `share`, `new_once`, `make_once`) speak the same language: `source` is a task number, and the lane that owns it publishes.
 
+---
+
 ## Synchronizing: `sync`
 
 `lane.sync()` is a barrier: no lane continues until all lanes arrive. Use it to separate phases where one phase reads what another wrote:
@@ -142,6 +154,8 @@ simulate :: proc() {
 The barrier is, by default, a sense-reversing futex barrier that spins briefly before sleeping — when all lanes arrive close together (the normal case for a per-frame gang), no lane enters the kernel, measured at ~41µs → ~1µs per 16-lane rendezvous compared to `core:sync.Barrier`. If you hit problems, or the spin burns CPU you need elsewhere (heavily oversubscribed machines, more lanes than cores), build with `-define:LANE_FAST_BARRIER=false` to fall back to `core:sync.Barrier` — behavior is identical either way, only the rendezvous cost changes.
 
 **The one rule that cannot be checked for you:** every lane must reach every `sync()` (and every collective, which synchronizes internally), in the same order. A lane that skips a barrier the others hit deadlocks the split. Never put collective ops behind a lane-dependent branch — compute the condition with `any_of`/`all_of` first so all lanes agree on it.
+
+---
 
 ## Moving data around
 
@@ -213,6 +227,8 @@ if err != nil {
 ```
 
 Only the slice form of `make` exists, deliberately: growable containers (`map`, `[dynamic]`) cannot be safely grown from several lanes, so sharing one is not a pattern worth sugaring.
+
+---
 
 ## Collectives
 
