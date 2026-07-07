@@ -51,7 +51,7 @@ update_entities :: proc() {
 | `sum` / `minimum` / `maximum` / `any_of` / `all_of` | Common reductions; result on every lane. |
 | `reduce(value, combine)` | Custom reduction, deterministic left-fold in lane order. |
 | `scan(value)` / `scan(value, identity, combine)` | Exclusive prefix sum/fold; returns `(offset/prefix, total)`. |
-| `MAIN`, `Proc`, `MAX_COLLECTIVE_SIZE` | Lane 0's index; the split proc type; collective value size limit (bytes). |
+| `MAIN`, `Proc`, `MAX_COLLECTIVE_SIZE` | Lane 0's index; the split proc type; collective value size limit in bytes — `-define:LANE_MAX_COLLECTIVE_SIZE` (power of two; defaults to the target's cache line: 64, or 128 on Apple Silicon). |
 
 ## Rules
 
@@ -279,33 +279,37 @@ tick_hash := lane.reduce(h, proc "contextless" (a, b: u64) -> u64 {
 });
 ```
 
-**`scan`** is the exclusive prefix sum, and it is how you build compact arrays in parallel with no atomics and a deterministic, stable order. Each lane says how many items it wants to output; `scan` returns where to write them and how big the final array is:
+**`scan`** is the exclusive prefix sum. `offset, total := lane.scan(value)` answers, on every lane at once: *how much did the lanes before me contribute* (`offset` — the sum of the values of lanes `0 ..< me`, excluding my own; `0` on lane 0), and *how much does everyone contribute together* (`total` — the same on every lane). With 4 lanes passing `3, 0, 5, 2`, the offsets come back `0, 3, 3, 8` and `total` is `10`: the windows `[offset, offset + value)` tile `[0, total)` exactly, each ending where the next begins. That makes `scan` a *reservation* primitive — each lane says "I want to output `value` items" and gets back where its window starts and how big the result ends up — with no atomics, and in lane order, so the layout is deterministic and stable (atomic-append compaction scrambles it with thread timing). Where `range` divides a known total into near-equal windows top-down, `scan` assembles lane-sized windows into a total bottom-up — reach for it when the total is the thing being computed:
 
 ```odin
 cull :: proc() {
-    lo, hi := lane.range(len(g_objects));
-
-    // Each lane has its own temp_allocator (see Rules), so this is a cheap,
-    // race-free bump allocation, sized to this lane's exact worst case.
-    visible_local := make([]int, hi - lo, context.temp_allocator);
+    chunk, base := lane.range(g_objects[:]);
+    hits := make([]int, len(chunk), context.temp_allocator);   // per-lane scratch (see Rules)
     n := 0;
-    for i in lo ..< hi {
-        if in_frustum(g_objects[i]) {
-            visible_local[n] = i;
+    for obj, i in chunk {
+        if in_frustum(obj) {                    // obj is in view, save to `hits` scratch
+            hits[n] = base + i;                 // = `g_objects` index of the obj we hit
             n += 1;
         }
     }
 
-    offset, total := lane.scan(n);
-    copy(g_visible[offset:][:n], visible_local[:n]);
-    if lane.is_main() do g_visible_count = total;
+    offset, total := lane.scan(n);              // offset: where MY hits go; total: final size
+    visible := lane.tmake_once([]int, total);   // the shared output, sized by total
+    copy(visible[offset:n], hits[:n]);
+    lane.sync();                                // all windows written: visible is packed and complete
 }
 ```
 
-The compaction is dense at both levels. Locally, `visible_local` is packed by construction: the write cursor `n` only advances on hits, so culled objects never leave holes (the buffer is sized `hi - lo` for the worst case; only the first `n` slots are ever written or copied). Globally, `scan` packs the lanes' dense chunks against each other: each lane's offset is exactly the previous lane's offset plus its count, so every window ends where the next begins, and `total` is the end of the last one. Because lane ranges are ordered and each lane writes in index order, `g_visible` comes out globally sorted and deterministic — the same input always yields the identical packed array, unlike atomic-append compaction, where thread timing scrambles the order.
+The generic form, `prefix, total := lane.scan(value, identity, combine)`, is the same idea with any associative op — `scan(n)` is exactly `scan(n, 0, +)`. `prefix` is the fold of everything *before* me, seeded with `identity` (lane 0 gets `identity` itself), and `total` is the fold of everything. `identity` must be the op's neutral value: `0` for `+`, `1` for `*`, `false` for `||`. The custom op is for when "what came before me" isn't a write position — history, for instance:
+
+```odin
+before, anyone := lane.scan(found, false, proc "contextless" (a, b: bool) -> bool { return a || b; });
+if found && !before { ... }   // the lowest-indexed lane that found it: a deterministic winner
+if anyone { ... }             // total degenerates into any_of
+```
+
+Non-commutative ops work too, because the fold order is fixed lane order: scanning per-lane segment transforms with matrix multiplication gives each lane the composed transform up to its doorstep as `prefix`, and root-to-tip as `total`.
 
 One discipline comes with per-lane temp allocations: each lane owns its arena, so each lane must also reset it — a plain `free_all` only resets the calling thread's arena. Call `lane.free_all_temp_allocators()` once per frame instead: it resets **every** lane's arena, main's included, so it *replaces* the usual end-of-frame `free_all(context.temp_allocator)` rather than adding to it. Outside a split it runs a minimal split under the hood; inside one, each lane frees its own arena, so reach it on every lane like any other collective — at the end of the frame's last lane proc, once no lane can still hold another lane's temp pointers.
 
-`scan` also has a generic form for custom ops, where `identity` is lane 0's prefix: `prefix, total := lane.scan(value, identity, combine)`.
-
-Collective values travel through cache-line-padded slots, so a value can be at most `lane.MAX_COLLECTIVE_SIZE` (64) bytes — a `matrix[4, 4]f32` fits exactly. Bigger types fail at compile time.
+Collective values travel through padded, aligned slots, so a value can be at most `lane.MAX_COLLECTIVE_SIZE` bytes — the target's cache line by default: 64, which a `matrix[4, 4]f32` fills exactly, or 128 on Apple Silicon; bigger types fail at compile time. Override it in bytes with `-define:LANE_MAX_COLLECTIVE_SIZE`, whether for a line size the default doesn't know (32 on many embedded parts) or to fit a fatter value type — it must be a power of two, because it doubles as the slot alignment that keeps different lanes' slots off each other's lines. If what you're moving is *data* rather than a value (kilobytes, not a fat struct), don't pump it through slot copies at all: put it on one lane and hand out a pointer (`share`, `new_once`), closing the phase with `sync`.

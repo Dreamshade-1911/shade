@@ -71,10 +71,18 @@ MAIN :: 0;
     active: bool,
 }
 
-// Collectives exchange one value per lane through cache-line-padded scratch
-// slots, so a value may be at most one cache line big (a matrix[4, 4]f32
-// still fits exactly).
-MAX_COLLECTIVE_SIZE :: 64;
+// Collectives exchange one value per lane through padded, aligned scratch
+// slots of MAX_COLLECTIVE_SIZE bytes: one cache line of the target by
+// default — 64 (a matrix[4, 4]f32 fits exactly), 128 on Apple Silicon.
+// Override it in bytes with -define:LANE_MAX_COLLECTIVE_SIZE, for a line
+// size the default doesn't know (32 on many embedded parts) or simply to
+// fit a fatter value type. It must be a power of two because it is also
+// the slot alignment, which is what keeps different lanes' slots on
+// separate lines. For payloads much bigger than a line, don't copy through
+// slots at all: put the data on one lane and share/new_once a pointer.
+MAX_COLLECTIVE_SIZE :: #config(LANE_MAX_COLLECTIVE_SIZE, 128 when ODIN_ARCH == .arm64 && ODIN_OS == .Darwin else 64);
+#assert(MAX_COLLECTIVE_SIZE > 0 && (MAX_COLLECTIVE_SIZE & (MAX_COLLECTIVE_SIZE - 1)) == 0,
+    "LANE_MAX_COLLECTIVE_SIZE must be a positive power of two (it doubles as the slot alignment).");
 
 @(private) Slot :: struct #align(MAX_COLLECTIVE_SIZE) {
     data: [MAX_COLLECTIVE_SIZE]u8,
@@ -196,8 +204,7 @@ deinit :: proc() {
 split :: proc(lane_proc: Proc, user_data: rawptr = nil) {
     assert(_live, "lane.split called before lane.init.");
     assert(!_state.active, "lane.split cannot be nested inside a running split.");
-    was_splitting := csync.atomic_exchange(&_splitting, true);
-    assert(!was_splitting, "Concurrent lane.split from multiple threads.");
+    assert(!csync.atomic_exchange(&_splitting, true), "Concurrent lane.split from multiple threads.");
 
     _split_proc = lane_proc;
     _split_data = user_data;
