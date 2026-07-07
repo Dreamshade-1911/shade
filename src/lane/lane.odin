@@ -72,8 +72,9 @@ MAIN :: 0;
 }
 
 // Collectives exchange one value per lane through padded, aligned scratch
-// slots of MAX_COLLECTIVE_SIZE bytes: one cache line of the target by
-// default — 64 (a matrix[4, 4]f32 fits exactly), 128 on Apple Silicon.
+// slots of MAX_COLLECTIVE_SIZE bytes (two banks, see the collectives): one
+// cache line of the target by default 64 (a matrix[4, 4]f32 fits exactly),
+// 128 on Apple Silicon.
 // Override it in bytes with -define:LANE_MAX_COLLECTIVE_SIZE, for a line
 // size the default doesn't know (32 on many embedded parts) or simply to
 // fit a fatter value type. It must be a power of two because it is also
@@ -88,22 +89,27 @@ MAX_COLLECTIVE_SIZE :: #config(LANE_MAX_COLLECTIVE_SIZE, 128 when ODIN_ARCH == .
     data: [MAX_COLLECTIVE_SIZE]u8,
 }
 
-@(private) _threads:    []^thread.Thread;
-@(private) _scratch:    []Slot;
-@(private) _count:      int = 1;
-@(private) _split_proc: Proc;
-@(private) _split_data: rawptr;
-@(private) _split_ctx:  runtime.Context;
-@(private) _broadcast:  rawptr;
-@(private) _wg:         csync.Wait_Group;
-@(private) _go:         csync.Futex; // Generation counter, bumped once per split (and once on deinit).
-@(private) _live:       bool;
-@(private) _splitting:  bool;
+@(private) _threads:      []^thread.Thread;
+@(private) _scratch:      []Slot;       // Two banks of _count slots (see the collectives).
+@(private) _count:        int = 1;
+@(private) _split_proc:   Proc;
+@(private) _split_data:   rawptr;
+@(private) _split_ctx:    runtime.Context;
+@(private) _broadcast:    rawptr;
+@(private) _pending:      csync.Futex;  // Workers still inside the current split.
+@(private) _join_waiting: csync.Futex;  // 1 while the splitter is parked on _pending.
+@(private) _go:           csync.Futex;  // Generation counter, bumped once per split (and once on deinit).
+@(private) _live:         bool;
+@(private) _splitting:    bool;
 @(private, thread_local) _state: State;
+@(private, thread_local) _collective_gen: uint; // Collectives reached this split; picks the scratch bank.
+
+// Spin iterations before sleeping in the kernel (barrier and split join).
+@(private) _SPIN :: 2000;
 
 // The default barrier is a sense-reversing futex barrier that spins briefly
 // before sleeping: when all lanes arrive close together (the normal case
-// for a per-frame gang), no lane ever enters the kernel -- measured
+// for a per-frame gang), no lane ever enters the kernel, measured
 // ~41us -> ~1us per 16-lane rendezvous vs core:sync's mutex+condvar
 // barrier. Build with -define:LANE_FAST_BARRIER=false to fall back to
 // core:sync.Barrier if you hit problems or the spinning burns CPU you need
@@ -111,34 +117,45 @@ MAX_COLLECTIVE_SIZE :: #config(LANE_MAX_COLLECTIVE_SIZE, 128 when ODIN_ARCH == .
 LANE_FAST_BARRIER :: #config(LANE_FAST_BARRIER, true);
 
 when LANE_FAST_BARRIER {
-    @(private) _bar_gen:   csync.Futex; // Generation counter (the sense).
-    @(private) _bar_count: csync.Futex; // Arrivals in the current generation.
-    @(private) _BAR_SPIN :: 2000;
+    @(private) _bar_gen:      csync.Futex; // Generation counter (the sense).
+    @(private) _bar_count:    csync.Futex; // Arrivals in the current generation.
+    @(private) _bar_sleepers: csync.Futex; // Lanes parked in the kernel on _bar_gen.
 
     @(private)
     _barrier_init :: proc "contextless" (count: int) {
-        _bar_gen   = 0;
-        _bar_count = 0;
+        _bar_gen      = 0;
+        _bar_count    = 0;
+        _bar_sleepers = 0;
     }
 
     @(private)
     _barrier :: proc "contextless" () {
-        gen := u32(csync.atomic_load(&_bar_gen));
-        if int(csync.atomic_add(&_bar_count, 1)) == _count - 1 {
+        gen := u32(csync.atomic_load_explicit(&_bar_gen, .Acquire));
+        if int(csync.atomic_add_explicit(&_bar_count, 1, .Acq_Rel)) == _count - 1 {
             // Last to arrive: reset BEFORE bumping the generation, so a
             // lane re-entering the next barrier can only increment after
-            // the reset.
-            csync.atomic_store(&_bar_count, 0);
+            // the reset. The bump stays seq_cst: the sleeper check below
+            // relies on it.
+            csync.atomic_store_explicit(&_bar_count, 0, .Release);
             csync.atomic_add(&_bar_gen, 1);
-            csync.futex_broadcast(&_bar_gen);
+
+            // Skip the kernel wake when nobody is parked. Safe: a sleeper
+            // bumps _bar_sleepers before futex_wait re-validates _bar_gen,
+            // so either we see it here or it sees the new generation and
+            // never sleeps.
+            if csync.atomic_load(&_bar_sleepers) != 0 {
+                csync.futex_broadcast(&_bar_gen);
+            }
         } else {
             spun := 0;
-            for u32(csync.atomic_load(&_bar_gen)) == gen {
-                if spun < _BAR_SPIN {
+            for u32(csync.atomic_load_explicit(&_bar_gen, .Acquire)) == gen {
+                if spun < _SPIN {
                     csync.cpu_relax();
                     spun += 1;
                 } else {
+                    csync.atomic_add(&_bar_sleepers, 1);
                     csync.futex_wait(&_bar_gen, gen);
+                    csync.atomic_sub_explicit(&_bar_sleepers, 1, .Relaxed);
                 }
             }
         }
@@ -172,7 +189,7 @@ init :: proc(thread_count := 0) {
     _go = 0;
     _live = true;
     _barrier_init(lc);
-    _scratch = make([]Slot, lc);
+    _scratch = make([]Slot, 2 * lc);   // two banks (see the collectives)
 
     _threads = make([]^thread.Thread, lc - 1);
     for i in 0 ..< lc - 1 {
@@ -209,16 +226,38 @@ split :: proc(lane_proc: Proc, user_data: rawptr = nil) {
     _split_proc = lane_proc;
     _split_data = user_data;
     _split_ctx  = context;
-    csync.wait_group_add(&_wg, _count - 1);
+    csync.atomic_store_explicit(&_pending, csync.Futex(_count - 1), .Relaxed);
     csync.atomic_add(&_go, 1); // Publishes the globals above: workers acquire _go before reading them.
     csync.futex_broadcast(&_go);
 
+    _collective_gen = 0;
     _state.active = true;
     lane_proc();
     _state.active = false;
 
-    csync.wait_group_wait(&_wg);
+    _join();
     csync.atomic_store(&_splitting, false);
+}
+
+// Waits for this split's workers. Spin first: they usually finish within
+// nanoseconds of the splitter, so parking just to be woken right away would
+// cost a wake round-trip per split. Same sleep handshake as the barrier:
+// raise _join_waiting, then futex_wait re-validates _pending.
+@(private)
+_join :: proc "contextless" () {
+    spun := 0;
+    for {
+        p := csync.atomic_load_explicit(&_pending, .Acquire);
+        if p == 0 do break;
+        if spun < _SPIN {
+            csync.cpu_relax();
+            spun += 1;
+        } else {
+            csync.atomic_store(&_join_waiting, 1);
+            csync.futex_wait(&_pending, u32(p));
+        }
+    }
+    csync.atomic_store_explicit(&_join_waiting, 0, .Relaxed);
 }
 
 // Frees every lane's temp allocator arena, the main thread's included:
@@ -243,7 +282,7 @@ _worker :: proc(t: ^thread.Thread) {
     gen: u32 = 0;
     for {
         csync.futex_wait(&_go, gen);
-        g := u32(csync.atomic_load(&_go));
+        g := u32(csync.atomic_load_explicit(&_go, .Acquire));
         if g == gen do continue; // Spurious wakeup.
         gen = g;
         if !csync.atomic_load(&_live) do break;
@@ -255,10 +294,17 @@ _worker :: proc(t: ^thread.Thread) {
         ctx.random_generator  = context.random_generator;
         context = ctx;
 
+        _collective_gen = 0;
         _state.active = true;
         _split_proc();
         _state.active = false;
-        csync.wait_group_done(&_wg);
+
+        // Last worker out signals the splitter, but only if it is parked.
+        if csync.atomic_sub(&_pending, 1) == 1 {
+            if csync.atomic_load(&_join_waiting) != 0 {
+                csync.futex_signal(&_pending);
+            }
+        }
     }
 }
 
@@ -291,10 +337,22 @@ sync :: #force_inline proc "contextless" () {
 broadcast :: proc "contextless" (p: ^$T, source := MAIN, loc := #caller_location) {
     assert_contextless(source >= 0, "lane.broadcast source task number must be non-negative.", loc);
     if !_state.active do return;
-    if owns(source)  do _broadcast = rawptr(p);
-    sync();
-    if !owns(source) do p^ = (cast(^T)_broadcast)^;
-    sync();
+    when size_of(T) <= MAX_COLLECTIVE_SIZE {
+        // The value rides through the source lane's scratch slot: one
+        // barrier, and the source is free to move on immediately.
+        bank := _next_bank();
+        if owns(source)  do _slot(T, _state.index, bank)^ = p^;
+        sync();
+        if !owns(source) do p^ = _slot(T, source % _count, bank)^;
+    } else {
+        // Too big for a slot: copy straight from the source lane's frame.
+        // The trailing sync keeps the source from moving on (and mutating
+        // or popping the pointee) while another lane is still copying.
+        if owns(source)  do _broadcast = rawptr(p);
+        sync();
+        if !owns(source) do p^ = (cast(^T)_broadcast)^;
+        sync();
+    }
 }
 
 // Shares a pointer to a variable living on the source lane's stack with
@@ -316,11 +374,11 @@ share :: proc "contextless" (p: ^$T, source := MAIN, loc := #caller_location) ->
 // new on one lane, everyone gets the pointer: the lane that owns task
 // source allocates a T and broadcasts the pointer, so all lanes alias one
 // heap value. The allocation uses the owning lane's allocator argument
-// (context.allocator by default) — free it with that allocator, on one
+// (context.allocator by default), free it with that allocator, on one
 // lane, after a sync. The error contract is new's own (ignorable via
 // #optional_allocator_error), with one addition: the error is broadcast
 // with the pointer, so every lane returns the same one and a failure
-// branch is all-or-nothing — free to contain collectives.
+// branch is all-or-nothing, free to contain collectives.
 // Outside a split this is plain new.
 new_once :: proc($T: typeid, source := MAIN, allocator := context.allocator, loc := #caller_location) -> (^T, runtime.Allocator_Error) #optional_allocator_error {
     r: struct { p: ^T, err: runtime.Allocator_Error };
@@ -330,7 +388,7 @@ new_once :: proc($T: typeid, source := MAIN, allocator := context.allocator, loc
 }
 
 // new_once on the owning lane's temp arena: shared frame scratch with
-// nothing to free — the end-of-frame free_all_temp_allocators reclaims it.
+// nothing to free, the end-of-frame free_all_temp_allocators reclaims it.
 tnew_once :: #force_inline proc($T: typeid, source := MAIN, loc := #caller_location) -> (^T, runtime.Allocator_Error) #optional_allocator_error {
     return new_once(T, source, context.temp_allocator, loc);
 }
@@ -360,14 +418,26 @@ tmake_once :: #force_inline proc($T: typeid/[]$E, #any_int len: int, source := M
 }
 
 // Collectives: combine one value per lane, returning the result to every
-// lane (two barriers, no atomics). All of them fold in fixed lane order, so
-// results are deterministic and bitwise identical on all lanes -- floats
-// included, which matters for lockstep. Outside a split they degrade to
-// their serial meaning (the value itself / empty prefix).
+// lane (one barrier). All of them fold in fixed lane order, so results are
+// deterministic and bitwise identical on all lanes. Outside a split they
+// degrade to their serial meaning (the value itself / empty prefix).
+//
+// The scratch is double-buffered: consecutive collectives use alternating
+// banks, so no trailing barrier is needed. A bank is only reused after the
+// next collective's barrier, by which point every fold of it has finished.
+// The per-lane bank counter resets each split and stays uniform because all
+// lanes reach the same collectives in the same order.
 
 @(private)
-_slot :: #force_inline proc "contextless" ($T: typeid, i: int) -> ^T {
-    return cast(^T)&_scratch[i].data;
+_next_bank :: #force_inline proc "contextless" () -> int {
+    bank := int(_collective_gen & 1);
+    _collective_gen += 1;
+    return bank;
+}
+
+@(private)
+_slot :: #force_inline proc "contextless" ($T: typeid, i, bank: int) -> ^T {
+    return cast(^T)&_scratch[bank * _count + i].data;
 }
 
 // Combines one value per lane with a custom op, e.g.:
@@ -375,48 +445,48 @@ _slot :: #force_inline proc "contextless" ($T: typeid, i: int) -> ^T {
 reduce :: proc "contextless" (value: $T, combine: proc "contextless" (a, b: T) -> T) -> T
     where size_of(T) <= MAX_COLLECTIVE_SIZE {
     if !_state.active do return value;
-    _slot(T, _state.index)^ = value;
+    bank := _next_bank();
+    _slot(T, _state.index, bank)^ = value;
     sync();
-    acc := _slot(T, 0)^;
-    for i in 1 ..< _count do acc = combine(acc, _slot(T, i)^);
-    sync();
+    acc := _slot(T, 0, bank)^;
+    for i in 1 ..< _count do acc = combine(acc, _slot(T, i, bank)^);
     return acc;
 }
 
 // Sum of one value per lane. Works on anything with +, including vectors.
 sum :: proc "contextless" (value: $T) -> T where size_of(T) <= MAX_COLLECTIVE_SIZE {
     if !_state.active do return value;
-    _slot(T, _state.index)^ = value;
+    bank := _next_bank();
+    _slot(T, _state.index, bank)^ = value;
     sync();
-    acc := _slot(T, 0)^;
-    for i in 1 ..< _count do acc += _slot(T, i)^;
-    sync();
+    acc := _slot(T, 0, bank)^;
+    for i in 1 ..< _count do acc += _slot(T, i, bank)^;
     return acc;
 }
 
 minimum :: proc "contextless" (value: $T) -> T where size_of(T) <= MAX_COLLECTIVE_SIZE {
     if !_state.active do return value;
-    _slot(T, _state.index)^ = value;
+    bank := _next_bank();
+    _slot(T, _state.index, bank)^ = value;
     sync();
-    acc := _slot(T, 0)^;
-    for i in 1 ..< _count do acc = min(acc, _slot(T, i)^);
-    sync();
+    acc := _slot(T, 0, bank)^;
+    for i in 1 ..< _count do acc = min(acc, _slot(T, i, bank)^);
     return acc;
 }
 
 maximum :: proc "contextless" (value: $T) -> T where size_of(T) <= MAX_COLLECTIVE_SIZE {
     if !_state.active do return value;
-    _slot(T, _state.index)^ = value;
+    bank := _next_bank();
+    _slot(T, _state.index, bank)^ = value;
     sync();
-    acc := _slot(T, 0)^;
-    for i in 1 ..< _count do acc = max(acc, _slot(T, i)^);
-    sync();
+    acc := _slot(T, 0, bank)^;
+    for i in 1 ..< _count do acc = max(acc, _slot(T, i, bank)^);
     return acc;
 }
 
 // True if the value is true on any lane (any_of) / on all lanes (all_of).
 // Beyond the reduction itself, these make a lane-dependent condition
-// uniform -- every lane gets the same answer, so every lane takes the same
+// uniform, every lane gets the same answer, so every lane takes the same
 // branch. Required whenever a branch or loop exit guards collectives, which
 // every lane must reach:
 //     if lane.any_of(local_dirty) {           // all-or-nothing branch
@@ -430,21 +500,21 @@ maximum :: proc "contextless" (value: $T) -> T where size_of(T) <= MAX_COLLECTIV
 // Outside a split they return the value unchanged.
 any_of :: proc "contextless" (value: bool) -> bool {
     if !_state.active do return value;
-    _slot(bool, _state.index)^ = value;
+    bank := _next_bank();
+    _slot(bool, _state.index, bank)^ = value;
     sync();
-    acc := _slot(bool, 0)^;
-    for i in 1 ..< _count do acc ||= _slot(bool, i)^;
-    sync();
+    acc := _slot(bool, 0, bank)^;
+    for i in 1 ..< _count do acc ||= _slot(bool, i, bank)^;
     return acc;
 }
 
 all_of :: proc "contextless" (value: bool) -> bool {
     if !_state.active do return value;
-    _slot(bool, _state.index)^ = value;
+    bank := _next_bank();
+    _slot(bool, _state.index, bank)^ = value;
     sync();
-    acc := _slot(bool, 0)^;
-    for i in 1 ..< _count do acc &&= _slot(bool, i)^;
-    sync();
+    acc := _slot(bool, 0, bank)^;
+    for i in 1 ..< _count do acc &&= _slot(bool, i, bank)^;
     return acc;
 }
 
@@ -460,14 +530,14 @@ scan :: proc { scan_sum, scan_custom }
 scan_sum :: proc "contextless" (value: $T) -> (offset, total: T)
     where size_of(T) <= MAX_COLLECTIVE_SIZE {
     if !_state.active { total = value; return; }
-    _slot(T, _state.index)^ = value;
+    bank := _next_bank();
+    _slot(T, _state.index, bank)^ = value;
     sync();
     for i in 0 ..< _count {
-        v := _slot(T, i)^;
+        v := _slot(T, i, bank)^;
         if i < _state.index do offset += v;
         total += v;
     }
-    sync();
     return;
 }
 
@@ -476,29 +546,29 @@ scan_sum :: proc "contextless" (value: $T) -> (offset, total: T)
 scan_custom :: proc "contextless" (value: $T, identity: T, combine: proc "contextless" (a, b: T) -> T) -> (prefix, total: T)
     where size_of(T) <= MAX_COLLECTIVE_SIZE {
     if !_state.active { prefix = identity; total = value; return; }
-    _slot(T, _state.index)^ = value;
+    bank := _next_bank();
+    _slot(T, _state.index, bank)^ = value;
     sync();
     prefix = identity;
     total  = identity;
     for i in 0 ..< _count {
-        v := _slot(T, i)^;
+        v := _slot(T, i, bank)^;
         if i < _state.index do prefix = combine(prefix, v);
         total = combine(total, v);
     }
-    sync();
     return;
 }
 
 // True on exactly one lane per n: task n belongs to lane n % count(). For
 // dispatching independent tasks by number without caring how many lanes are
-// actually running — the modulo folds any task count onto any lane count,
+// actually running, the modulo folds any task count onto any lane count,
 // so the same dispatch code works on 16 lanes, on 2, or serially (where the
 // one lane owns every task):
 //     if lane.owns(0) do step_physics();
 //     if lane.owns(1) do step_audio();
 //     if lane.owns(2) do step_particles();   // folds onto lane 0 with 2 lanes
 // The task number doubles as a stable identity for managing per-task data.
-// lane.is_main() is the same test with the lane chosen for you — it picks
+// lane.is_main() is the same test with the lane chosen for you, it picks
 // the main lane, for work that must run there (equivalent to lane.owns(0)).
 // Collectives with a source parameter (broadcast, share, new_once,
 // make_once) speak the same language: source is a task number, and the
@@ -546,8 +616,8 @@ range_slice :: proc "contextless" (s: []$T) -> (chunk: []T, lo: int) {
 //     }
 //     lane.sync();
 // Without the share every lane would spin its own cursor and process
-// everything. Like range, an overload group — index form, and slice form
-// with the chunk's base index:
+// everything. Like range, an overload group (index form, and slice form
+// with the chunk's base index):
 //     for lo, hi in lane.grab(cursor_ptr, len(items), 16) { ... }
 //     for chunk, lo in lane.grab(cursor_ptr, items, 16) { ... } // chunk[j] is items[lo + j]
 grab :: proc { grab_index, grab_slice }

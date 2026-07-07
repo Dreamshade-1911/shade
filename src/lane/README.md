@@ -232,7 +232,7 @@ Only the slice form of `make` exists, deliberately: growable containers (`map`, 
 
 ## Collectives
 
-Collectives combine one value per lane and hand the result to **every** lane (two barriers, no atomics). They fold in fixed lane order, so results are deterministic and bitwise identical on all lanes — floats included, which is what a lockstep simulation needs.
+Collectives combine one value per lane and hand the result to **every** lane (one barrier and double-buffered scratch). They fold in fixed lane order, so results are deterministic and bitwise identical on all lanes — floats included, which is what a lockstep simulation needs.
 
 ```odin
 total_energy := lane.sum(local_energy);          // + works on vectors too
@@ -295,7 +295,7 @@ tick_hash := lane.reduce(h, proc "contextless" (a, b: u64) -> u64 {
 });
 ```
 
-**`scan`** is the exclusive prefix sum. `offset, total := lane.scan(value)` answers, on every lane at once: *how much did the lanes before me contribute* (`offset` — the sum of the values of lanes `0 ..< me`, excluding my own; `0` on lane 0), and *how much does everyone contribute together* (`total` — the same on every lane). With 4 lanes passing `3, 0, 5, 2`, the offsets come back `0, 3, 3, 8` and `total` is `10`: the windows `[offset, offset + value)` tile `[0, total)` exactly, each ending where the next begins. That makes `scan` a *reservation* primitive — each lane says "I want to output `value` items" and gets back where its window starts and how big the result ends up — with no atomics, and in lane order, so the layout is deterministic and stable (atomic-append compaction scrambles it with thread timing). Where `range` divides a known total into near-equal windows top-down, `scan` assembles lane-sized windows into a total bottom-up — reach for it when the total is the thing being computed:
+**`scan`** is the exclusive prefix sum. `offset, total := lane.scan(value)` answers, on every lane at once: *how much did the lanes before me contribute* (`offset` — the sum of the values of lanes `0 ..< me`, excluding my own; `0` on lane 0), and *how much does everyone contribute together* (`total` — the same on every lane). With 4 lanes passing `3, 0, 5, 2`, the offsets come back `0, 3, 3, 8` and `total` is `10`: the windows `[offset, offset + value)` tile `[0, total)` exactly, each ending where the next begins. That makes `scan` a *reservation* primitive — each lane says "I want to output `value` items" and gets back where its window starts and how big the result ends up, and in lane order, so the layout is deterministic and stable (atomic-append compaction scrambles it with thread timing). Where `range` divides a known total into near-equal windows top-down, `scan` assembles lane-sized windows into a total bottom-up — reach for it when the total is the thing being computed:
 
 ```odin
 cull :: proc() {
