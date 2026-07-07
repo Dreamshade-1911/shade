@@ -121,9 +121,9 @@ start :: proc() -> bool {
     defer delete(g_hud_verts);
 
     g_app.cam_center = { 0, 0 };
-    g_app.cam_half   = DISK_RADIUS * 1.3;
+    g_app.cam_half   = DISK_RADIUS * 1.4;
     g_app.cam_zoom   = 1;
-    g_app.time_scale = TIME_SCALE;
+    g_app.time_scale = 1;
 
     g_app.refresh_rate = get_refresh_rate();
     g_app.last_tick = time.tick_now();

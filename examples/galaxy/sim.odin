@@ -47,7 +47,10 @@ DISK_RADIUS    :: 520.0;    // initial disk extent, world units
 SOFTENING2     :: 400.0;    // epsilon^2, keeps close pairs (esp. the core) tame
 SPEED_REF      :: 900.0;    // speed that maps to the hottest color
 MAX_SPEED      :: 6000.0;   // clamp to survive the odd slingshot
-TIME_SCALE     :: 1.0;      // initial sim-speed multiplier (Left / Right change it at runtime)
+
+// Re-circularization: each frame every body's velocity is nudged this fraction
+// per second toward the circular orbit at its current radius. Set to 0 for pure gravity.
+RECIRC_RATE :: 0.1;
 
 // Containment wall: bodies stay within this radius of the core so escapees
 // can't drag the auto-fit camera out forever. Crossing it puts a body back on
@@ -59,8 +62,8 @@ BOUND_RESTITUTION :: 0.6;
 // Mouse "brush": a bounded, smooth pull/push, strongest under the cursor and
 // zero at the edge of its radius. The radius is a fraction of the view so it
 // feels the same however far the camera has zoomed (set in main.odin).
-BRUSH_ACCEL       :: 2000.0;
-BRUSH_RADIUS_FRAC :: 0.50;
+BRUSH_ACCEL       :: 4000.0;
+BRUSH_RADIUS_FRAC :: 0.4;
 
 DEFAULT_BODIES :: 4000;
 MIN_BODIES     :: 1000;
@@ -223,9 +226,19 @@ simulate :: proc() {
         // Body 0 (the core) stays put so the galaxy doesn't wander off-screen.
         if i != 0 {
             vel := g_vel[i] + g_acc[i] * dt;
+
+            // Nudge particles back into orbit.
+            p := Vec2 { g_hot[i].x, g_hot[i].y };
+            if r := linalg.length(p); r > 1 {
+                tangent := Vec2 { -p.y, p.x } / r;
+                if linalg.dot(vel, tangent) < 0 do tangent = -tangent;
+                v_circ := tangent * math.sqrt(G * CENTER_MASS / r);
+                vel += (v_circ - vel) * min(RECIRC_RATE * dt, 1);
+            }
+
             speed := linalg.length(vel);
             if speed > MAX_SPEED do vel *= MAX_SPEED / speed;
-            pos := Vec2 { g_hot[i].x, g_hot[i].y } + vel * dt;
+            pos := p + vel * dt;
 
             // Containment wall: put escapees back on the rim and bounce the
             // outward part of their velocity (damped), keeping the tangential
