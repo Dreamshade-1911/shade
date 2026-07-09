@@ -49,7 +49,7 @@ update_entities :: proc() {
 | `is_task_lane(n)` | Returns comparison with current lane's index with `task_lane(n)`, same as `lane.index() == lane.task_lane(n)`. |
 | `sync()` | Barrier across all lanes. |
 | `free_all_temp_allocators()` | Reset every lane's temp arena, main's included — replaces the end-of-frame `free_all`. Once per frame, inside or outside a split. |
-| `broadcast(&value, source := MAIN)` | Copy one lane's variable to all lanes (each gets a snapshot). `source` is a lane index; pass `task_index(n)` for task-numbered dispatch. |
+| `broadcast(&value, source := MAIN)` | Copy one lane's variable to all lanes (each gets a snapshot). `source` is a lane index, pass `task_lane(n)` for task-numbered dispatch. |
 | `share(&value, source := MAIN) -> ^T` | Pointer to the source lane's stack variable on every lane; pin it with `sync` per phase. |
 | `new_once(T, ...)` / `make_once([]T, len, ...)` | Allocate on the source lane, alias on every lane; the `Allocator_Error` is broadcast too (same on every lane, ignorable). Free on one lane, after a sync. |
 | `tnew_once(T, ...)` / `tmake_once([]T, len, ...)` | The same, on the source lane's temp arena — nothing to free, `free_all_temp_allocators` reclaims it. |
@@ -77,7 +77,7 @@ Misuse fails the way the rest of Odin fails, and the test suite (`test.bat lane`
 | Misuse | Result |
 |---|---|
 | `split`/`init` misuse (before init, twice, nested, concurrent), `deinit` inside a split | `assert` with a clear message; compiled out by `-disable-assert` |
-| An out-of-range `source` lane index (`broadcast`/`share`/`new_once`/`make_once`) | Bounds check at the caller's line, like any array index; fold task numbers into range with `task_index(n)` |
+| An out-of-range `source` lane index (`broadcast`/`share`/`new_once`/`make_once`) | Bounds check at the caller's line, like any array index; fold task numbers into range with `task_lane(n)` |
 | A lane skips a `sync`/collective the others reach | Deadlock — inherent to barriers, cannot be checked cheaply |
 
 Debug builds keep every check; the release target (`-disable-assert -no-bounds-check`) strips them all.
@@ -124,16 +124,22 @@ for chunk, lo in lane.grab(&cursor, items, 16) { ... }  // chunk[j] is items[lo 
 
 Pick the chunk size so that a chunk is meaningful work (hundreds of cycles at least); tiny chunks turn the cursor into a contention point.
 
-**`task_index` — dispatching tasks by number.** Where `range` and `grab` split a loop, `lane.task_index(n)` hands out whole tasks: it returns the lane that task `n` folds onto (`n % count()`). Number the tasks you know are independent and dispatch them without caring how many lanes are actually running — the modulo folds any task count onto any lane count, so the same code works on 16 lanes, on 2, or serially (where lane 0 gets every task):
+**`task_lane` — dispatching tasks by number.** Where `range` and `grab` split a loop, `lane.task_lane(n)` hands out whole tasks: it returns the lane that task `n` folds onto (`n % count()`). Number the tasks you know are independent and dispatch them without caring how many lanes are actually running — the modulo folds any task count onto any lane count, so the same code works on 16 lanes, on 2, or serially (where lane 0 gets every task):
+
+**`is_task_lane` — utility.** Just does a simple comparison against the current lane's index, the same as `lane.index() == task_lane(n)`.
 
 ```odin
-me := lane.index();
-if me == lane.task_index(0) do step_physics();
-if me == lane.task_index(1) do step_audio();
-if me == lane.task_index(2) do step_particles();   // lane 0 with 2 lanes
+if is_task_lane(0) do step_physics();
+if is_task_lane(1) do step_audio();
+if is_task_lane(2) do step_particles();   // lane 0 with 2 lanes
+
+for i in 0 ..< n {
+    lane_index := lane.task_lane(i);
+    // do something with it...
+}
 ```
 
-The task number doubles as a stable identity for managing per-task data. `lane.is_main()` covers the common case of work that must run on the main lane, like main-thread-only APIs. Collectives with a source parameter (`broadcast`, `share`, `new_once`, `make_once`) take a plain lane index: pass `task_index(n)` to publish from whoever gets task `n`.
+The task number doubles as a stable identity for managing per-task data. `lane.is_main()` covers the common case of work that must run on the main lane, like main-thread-only APIs. Collectives with a source parameter (`broadcast`, `share`, `new_once`, `make_once`) take a plain lane index: pass `task_lane(n)` to publish from whoever gets task `n`.
 
 ---
 
@@ -187,10 +193,10 @@ tick :: proc() {
 }
 ```
 
-The source defaults to `lane.MAIN` and is a plain lane index, bounds-checked like any array index (see [Failure contract](#failure-contract)). For task-numbered dispatch, fold the task onto a lane once with [`task_index`](#distributing-work) and use the result for both the work and the broadcast:
+The source defaults to `lane.MAIN` and is a plain lane index, bounds-checked like any array index (see [Failure contract](#failure-contract)). For task-numbered dispatch, fold the task onto a lane once with [`task_lane`](#distributing-work) and use the result for both the work and the broadcast:
 
 ```odin
-src := lane.task_index(3);                       // whoever gets task 3
+src := lane.task_lane(3);                        // whoever gets task 3
 if lane.index() == src do result = compute();
 lane.broadcast(&result, src);                    // ...is also the broadcast source
 ```
