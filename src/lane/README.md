@@ -27,9 +27,9 @@ update_entities :: proc() {
 
 ## The model
 
-- **Lanes are fixed.** `lane.init(thread_count)` creates `thread_count` lanes, with a value of 0 = `os.processor_core_count`. The calling thread is always lane `lane.MAIN` (`0`) in every split; worker `i` is always lane `i`, for the whole program. Per-lane data (scratch arenas, RNG streams, profiler slots) can therefore be indexed by `lane.index()` and allocated once, sized with `lane.capacity()`.
-- **The splitter participates.** `lane.split(p)` runs `p` on all lanes, including the caller, and returns when every lane has finished. Because the caller is always lane `MAIN`, main-thread-only APIs (SDL event pump, etc.) work inside a split behind `if lane.is_main()`.
-- **Serial code is the degenerate case, by construction.** Outside a split, `count()` is `1` and `index()` is `0`, so `range(n)` covers everything, `sync()`/`broadcast()` are no-ops, and every collective returns its input. The same proc runs correctly SPMD, serially, and under `lane.init(1)` (single-threaded mode, useful for debugging and platforms where you want the engine on one core — with a constant `1` most of it optimizes away).
+- **The pool is fixed; the active count isn't.** `lane.init(thread_count)` spawns a pool of `thread_count` lanes (0 = `os.processor_core_count`); the thread set never changes until `deinit`. The calling thread is always lane `lane.MAIN` (`0`) in every split; worker `i` is always lane `i`, for the whole program. `lane.capacity()` is that fixed pool size — size per-lane data (scratch arenas, RNG streams, profiler slots) to it, index by `lane.index()`. How many of those lanes a split actually runs is `lane.active_count()`, which defaults to the whole pool but can be narrowed with `lane.set_active_count(n)` between splits (idle lanes just park) — dial core usage at runtime without re-spawning. `capacity()` stays put when you do, so your storage stays valid; iterate the live lanes with `active_count()`.
+- **The splitter participates.** `lane.split(p)` runs `p` on all active lanes, including the caller, and returns when every lane has finished. Because the caller is always lane `MAIN`, main-thread-only APIs (SDL event pump, etc.) work inside a split behind `if lane.is_main()`.
+- **Serial code is the degenerate case, by construction.** Outside a split, `active_count()` is `1` and `index()` is `0`, so `range(n)` covers everything, `sync()`/`broadcast()` are no-ops, and every collective returns its input. The same proc runs correctly SPMD, serially, and under `lane.init(1)` (single-threaded mode, useful for debugging and platforms where you want the engine on one core — with a constant `1` most of it optimizes away).
 
 ---
 
@@ -40,19 +40,19 @@ update_entities :: proc() {
 | `init(thread_count := 0)` | Spawn the gang; `0` = logical core count. |
 | `deinit()` | Join and free the gang. |
 | `split(p: Proc, user_data: rawptr = nil)` | Run `p` on every lane; returns when all finish. |
-| `index()` / `count()` / `is_main()` | This lane's identity. Serial: `0` / `1` / `true`. |
-| `capacity()` | Configured lane count, valid outside splits; for sizing per-lane storage. |
+| `index()` / `active_count()` / `is_main()` | This lane's index, the current split's live lane count, is-lane-0. Serial: `0` / `1` / `true`. |
+| `capacity()` | Fixed pool size (max lanes), valid outside splits; for sizing per-lane storage. |
+| `set_active_count(n)` | Set how many lanes the next split(s) use: `[1, capacity()]`, or `0` for all. Asserted in range, outside a split only. |
 | `user_data()` / `user_data(^T)` | The split's user pointer, raw or cast. |
 | `range(n or slice)` | This lane's static share: `(lo, hi)` bounds from a length, `(sub-slice, base index)` from a slice. |
 | `grab(&cursor, n or slice, chunk_size)` | Dynamic chunking off a shared atomic cursor. |
-| `task_lane(n)` | The lane that task `n` folds onto (`n % count()`). |
+| `task_lane(n)` | The lane that task `n` folds onto (`n % active_count()`). |
 | `is_task_lane(n)` | Returns comparison with current lane's index with `task_lane(n)`, same as `lane.index() == lane.task_lane(n)`. |
 | `sync()` | Barrier across all lanes. |
-| `free_all_temp_allocators()` | Reset every lane's temp arena, main's included — replaces the end-of-frame `free_all`. Once per frame, inside or outside a split. |
-| `broadcast(&value, source := MAIN)` | Copy one lane's variable to all lanes (each gets a snapshot). `source` is a lane index, pass `task_lane(n)` for task-numbered dispatch. |
+| `broadcast(&value, source := MAIN)` | Copy one lane's variable to all lanes (each gets a snapshot). `source` is a lane index; pass `task_lane(n)` for task-numbered dispatch. |
 | `share(&value, source := MAIN) -> ^T` | Pointer to the source lane's stack variable on every lane; pin it with `sync` per phase. |
 | `new_once(T, ...)` / `make_once([]T, len, ...)` | Allocate on the source lane, alias on every lane; the `Allocator_Error` is broadcast too (same on every lane, ignorable). Free on one lane, after a sync. |
-| `tnew_once(T, ...)` / `tmake_once([]T, len, ...)` | The same, on the source lane's temp arena — nothing to free, `free_all_temp_allocators` reclaims it. |
+| `tnew_once(T, ...)` / `tmake_once([]T, len, ...)` | The same, on the source lane's temp arena. |
 | `sum` / `minimum` / `maximum` / `any_of` / `all_of` | Common reductions; result on every lane. |
 | `reduce(value, combine)` | Custom reduction, deterministic left-fold in lane order. |
 | `scan(value)` / `scan(value, identity, combine)` | Exclusive prefix sum/fold; returns `(offset/prefix, total)`. |
@@ -62,9 +62,9 @@ update_entities :: proc() {
 
 ## Rules
 
-1. **`init` first, `deinit` last.** The lane count is fixed in between.
+1. **`init` first, `deinit` last.** The thread pool is fixed in between; `set_active_count` varies how many of those lanes a split uses, but only outside a split.
 2. **One split at a time**, no nesting, always from the thread that called `init`. All of these are asserted.
-3. **Lanes run with the splitter's `context`**, so `context.allocator` must be thread-safe during a split (the default heap allocator is). Each lane keeps its *own* `temp_allocator` and `random_generator` — free per-lane scratch, but also the reason a value temp-allocated by one lane must not be freed by another, and why each lane must `free_all` its own arena — `lane.free_all_temp_allocators()` once per frame does it for all of them (see the culling example).
+3. **Lanes run with the splitter's `context`**, so `context.allocator` must be thread-safe during a split (the default heap allocator is). Each lane keeps its *own* `temp_allocator` and `random_generator` — free per-lane scratch, but also the reason a value temp-allocated by one lane must not be freed by another, and why each lane must `free_all` its own arena.
 4. **Collectives are collective.** Every lane, every collective, same order (see [Synchronizing](#synchronizing-sync)).
 5. Threads that are not lanes (e.g. a dedicated audio thread) may call any of the query/collective procs safely: they see the serial behavior. They may not call `split`.
 
@@ -124,19 +124,12 @@ for chunk, lo in lane.grab(&cursor, items, 16) { ... }  // chunk[j] is items[lo 
 
 Pick the chunk size so that a chunk is meaningful work (hundreds of cycles at least); tiny chunks turn the cursor into a contention point.
 
-**`task_lane` — dispatching tasks by number.** Where `range` and `grab` split a loop, `lane.task_lane(n)` hands out whole tasks: it returns the lane that task `n` folds onto (`n % count()`). Number the tasks you know are independent and dispatch them without caring how many lanes are actually running — the modulo folds any task count onto any lane count, so the same code works on 16 lanes, on 2, or serially (where lane 0 gets every task):
-
-**`is_task_lane` — utility.** Just does a simple comparison against the current lane's index, the same as `lane.index() == task_lane(n)`.
+**`task_lane` / `is_task_lane` — dispatching tasks by number.** Where `range` and `grab` split a loop, these hand out whole tasks: `lane.task_lane(n)` returns the lane task `n` folds onto (`n % active_count()`), and `lane.is_task_lane(n)` is the shorthand for `lane.index() == lane.task_lane(n)`. Number the tasks you know are independent and dispatch them without caring how many lanes are actually running — the modulo folds any task count onto any lane count, so the same code works on 16 lanes, on 2, or serially (where lane 0 gets every task):
 
 ```odin
-if is_task_lane(0) do step_physics();
-if is_task_lane(1) do step_audio();
-if is_task_lane(2) do step_particles();   // lane 0 with 2 lanes
-
-for i in 0 ..< n {
-    lane_index := lane.task_lane(i);
-    // do something with it...
-}
+if lane.is_task_lane(0) do step_physics();
+if lane.is_task_lane(1) do step_audio();
+if lane.is_task_lane(2) do step_particles();   // lane 0 with 2 lanes
 ```
 
 The task number doubles as a stable identity for managing per-task data. `lane.is_main()` covers the common case of work that must run on the main lane, like main-thread-only APIs. Collectives with a source parameter (`broadcast`, `share`, `new_once`, `make_once`) take a plain lane index: pass `task_lane(n)` to publish from whoever gets task `n`.
@@ -196,7 +189,7 @@ tick :: proc() {
 The source defaults to `lane.MAIN` and is a plain lane index, bounds-checked like any array index (see [Failure contract](#failure-contract)). For task-numbered dispatch, fold the task onto a lane once with [`task_lane`](#distributing-work) and use the result for both the work and the broadcast:
 
 ```odin
-src := lane.task_lane(3);                        // whoever gets task 3
+src := lane.task_lane(3);                         // whoever gets task 3
 if lane.index() == src do result = compute();
 lane.broadcast(&result, src);                    // ...is also the broadcast source
 ```
@@ -222,7 +215,7 @@ visible := lane.tmake_once([]int, total);
 copy(visible[offset:][:n_visible], visible_local[:n_visible]);
 ```
 
-The allocation happens on lane `source` (default `MAIN`), with that lane's `allocator` argument — so it must be freed with that allocator, by one lane, after a sync. **`tnew_once` / `tmake_once`** are the same procs with the allocator pinned to the source lane's `context.temp_allocator`, and they are the common case, as above: frame-scoped shared scratch with no freeing question at all — the end-of-frame `free_all_temp_allocators` reclaims it.
+The allocation happens on lane `source` (default `MAIN`), with that lane's `allocator` argument — so it must be freed with that allocator, by one lane, after a sync. **`tnew_once` / `tmake_once`** are the same procs with the allocator pinned to the source lane's `context.temp_allocator`, and they are the common case, as above: frame-scoped shared scratch with no freeing question at all.
 
 The error contract is `new`/`make`'s own — an ignorable `Allocator_Error` (`#optional_allocator_error`) — with one addition: the error is broadcast along with the result, so **every lane returns the same error**. An error only one lane could see would be a divergent branch waiting to happen; because all lanes agree, the failure branch is all-or-nothing and may freely contain syncs and collectives:
 
@@ -333,6 +326,8 @@ if anyone { ... }             // total degenerates into any_of
 
 Non-commutative ops work too, because the fold order is fixed lane order: scanning per-lane segment transforms with matrix multiplication gives each lane the composed transform up to its doorstep as `prefix`, and root-to-tip as `total`.
 
-One discipline comes with per-lane temp allocations: each lane owns its arena, so each lane must also reset it — a plain `free_all` only resets the calling thread's arena. Call `lane.free_all_temp_allocators()` once per frame instead: it resets **every** lane's arena, main's included, so it *replaces* the usual end-of-frame `free_all(context.temp_allocator)` rather than adding to it. Outside a split it runs a minimal split under the hood; inside one, each lane frees its own arena, so reach it on every lane like any other collective — at the end of the frame's last lane proc, once no lane can still hold another lane's temp pointers.
+One discipline comes with per-lane temp allocations: each lane owns its own arena, and there is no library call that clears all of them at once. A plain `free_all(context.temp_allocator)` resets only the calling thread's arena, so end a frame by calling it *inside a split, on every lane* — put it at the end of the frame's last lane proc, once no lane can still hold another lane's temp pointers, and every arena resets in lockstep. The main lane's arena is just lane `MAIN`'s, cleared the same way; there is no separate serial `free_all` to remember.
+
+`set_active_count` interacts with this: a `free_all` inside a split runs only on the lanes that split actually used, so narrowing the active count parks the higher lanes with whatever they last temp-allocated still resident. That memory is not leaked — it is reused the next time that lane runs and clears — but it stays committed until then, and a lane that never becomes active again never clears at all. If you widen the count later, those lanes wake up on top of stale arenas. Clear at full width before narrowing, or size arenas for the high-water mark, if that resident memory matters.
 
 Collective values travel through padded, aligned slots, so a value can be at most `lane.MAX_COLLECTIVE_SIZE` bytes — the target's cache line by default: 64, which a `matrix[4, 4]f32` fills exactly, or 128 on Apple Silicon; bigger types fail at compile time. Override it in bytes with `-define:LANE_MAX_COLLECTIVE_SIZE`, whether for a line size the default doesn't know (32 on many embedded parts) or to fit a fatter value type — it must be a power of two, because it doubles as the slot alignment that keeps different lanes' slots off each other's lines. If what you're moving is *data* rather than a value (kilobytes, not a fat struct), don't pump it through slot copies at all: put it on one lane and hand out a pointer (`share`, `new_once`), closing the phase with `sync`.

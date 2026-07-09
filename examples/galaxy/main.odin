@@ -113,7 +113,7 @@ start :: proc() -> bool {
     g_app.renderer = init_renderer(g_app.gpu, g_app.window) or_return;
     defer destroy_renderer(g_app.gpu, &g_app.renderer);
 
-    lane.init();   // 0 = one lane per logical core
+    lane.init();
     defer lane.deinit();
 
     init_bodies(DEFAULT_BODIES);
@@ -190,8 +190,9 @@ frame :: proc() {
         update_title();
     }
 
-    // Fine to call outside split (will split just to call free_all internally).
-    lane.free_all_temp_allocators();
+    // End of frame: reset every lane's temp arena. No lane can still hold
+    // another lane's temp pointers here, and each lane frees its own.
+    lane.split(proc() { free_all(context.temp_allocator) });
 
     // Save actual frame time before sleeping.
     a.work_ms = f32(time.duration_milliseconds(time.tick_since(a.last_tick)));

@@ -32,6 +32,7 @@ CASES :: []Case {
     { "smoke",             .Ok,   "normal use: 200 splits, re-init, 1-lane mode, serial fallback" },
     { "grab",              .Ok,   "dynamic chunking: every index covered exactly once, ragged chunks, n=0, serial use" },
     { "task_lane",         .Ok,   "task dispatch: every task folds onto exactly one lane, n % count, serial fallback" },
+    { "active_count",      .Ok,   "set_active_count: reduced active count covers the range, folds over active lanes, capacity stable, scratch banks intact" },
     { "once",              .Ok,   "new_once/make_once and t- variants: one allocation aliased by all lanes, task-numbered source, uniform allocation error, serial fallback" },
     { "collectives",       .Ok,   "reduce/sum/minimum/maximum/any_of/all_of/scan: fold order, vectors, compaction, serial degrade" },
     { "nested_split",      .Die,  "lane.split from inside a split (main lane)" },
@@ -113,6 +114,7 @@ run_case :: proc(name: string) {
     case "smoke":             case_smoke();
     case "grab":              case_grab();
     case "task_lane":         case_task_lane();
+    case "active_count":      case_active_count();
     case "once":              case_once();
     case "collectives":       case_collectives();
     case "nested_split":      case_nested_split();
@@ -139,7 +141,7 @@ task_lane_work :: proc() {
     me := lane.index();
     for i in 0 ..< N {
         if lane.is_task_lane(i) {
-            assert(me == i % lane.count(), "is_task_lane picked the wrong lane");
+            assert(me == i % lane.active_count(), "is_task_lane picked the wrong lane");
             _seen[i] += 1;
         }
     }
@@ -159,6 +161,54 @@ case_task_lane :: proc() {
 
     // Serial fallback: every task folds onto lane 0.
     for i in 0 ..< N do assert(lane.task_lane(i) == 0, "serial task_lane must fold onto lane 0");
+}
+
+active_count_work :: proc() {
+    // Static range must tile [0, N) across exactly the active lanes.
+    lo, hi := lane.range(N);
+    for i in lo ..< hi do _seen[i] += 1;
+
+    // Three collectives in a row exercise the double-buffered scratch under a
+    // reduced active count: if the bank stride tracked active_count instead of
+    // capacity, bank 1 would overlap bank 0 and corrupt these.
+    n := lane.active_count();
+    assert(lane.sum(1) == n, "sum folded the wrong number of lanes");
+    off, tot := lane.scan(1);
+    assert(off == lane.index() && tot == n, "scan wrong under reduced active count");
+
+    // Broadcast from the top active lane: a non-MAIN source whose slot sits at
+    // index active_count-1, the last valid slot in the (possibly shrunk) bank.
+    src := n - 1;
+    v := 0;
+    if lane.index() == src do v = 9;
+    lane.broadcast(&v, src);
+    assert(v == 9, "broadcast from the top active lane failed");
+}
+
+case_active_count :: proc() {
+    lane.init();   // capacity = core count
+    cap := lane.capacity();
+
+    // Every active count from 1 up to the full pool must behave identically.
+    for active in 1 ..= cap {
+        lane.set_active_count(active);
+        for i in 0 ..< N do _seen[i] = 0;
+        lane.split(active_count_work);
+        for i in 0 ..< N do assert(_seen[i] == 1, "range left a hole or overlapped under reduced active count");
+    }
+
+    // 0 means the whole pool (mirrors init's 0 = core count).
+    lane.set_active_count(0);
+    for i in 0 ..< N do _seen[i] = 0;
+    lane.split(active_count_work);
+    for i in 0 ..< N do assert(_seen[i] == 1, "set_active_count(0) must use the full pool");
+
+    // The pool is fixed; only the participant count moved.
+    lane.set_active_count(1);
+    assert(lane.capacity() == cap, "capacity must not change with active count");
+    assert(lane.active_count() == 1, "active_count outside a split must be 1");
+
+    lane.deinit();
 }
 
 once_work :: proc() {
@@ -199,7 +249,7 @@ once_work :: proc() {
     lane.sync();
     assert(ts[0] == 1, "tmake_once slice not shared");
     lane.sync(); // No lane may still read temp memory once arenas reset.
-    lane.free_all_temp_allocators();
+    free_all(context.temp_allocator); // each lane clears its own arena
 
     // The allocation error is broadcast with the result: even though only
     // the owning lane called the allocator, every lane returns the same
@@ -267,11 +317,16 @@ temp_alloc_work :: proc() {
     for &v, i in scratch do v = lane.index() + i;
     assert(scratch[1] == lane.index() + 1, "temp allocation corrupt");
 
-    // In-split form: every lane frees its own arena, then allocates again.
-    lane.free_all_temp_allocators();
+    // Every lane frees its own arena, then allocates again.
+    free_all(context.temp_allocator);
     scratch2 := make([]int, 64, context.temp_allocator);
     scratch2[0] = lane.index();
     assert(scratch2[0] == lane.index(), "temp allocation after in-split reset corrupt");
+}
+
+// Resets every active lane's temp arena; split() this from outside a split.
+clear_temp :: proc() {
+    free_all(context.temp_allocator);
 }
 
 case_smoke :: proc() {
@@ -279,7 +334,7 @@ case_smoke :: proc() {
     tag := 777;
 
     lane.init();
-    assert(lane.count() == 1 && lane.index() == 0, "bad state outside split");
+    assert(lane.active_count() == 1 && lane.index() == 0, "bad state outside split");
     for _ in 0 ..< 200 {
         _total = 0;
         lane.split(sum_work, &tag);
@@ -287,8 +342,9 @@ case_smoke :: proc() {
     }
 
     // Per-lane temp allocations, reset across all lanes, then reused.
+    // No serial helper resets every arena, so clear inside a split.
     lane.split(temp_alloc_work);
-    lane.free_all_temp_allocators();
+    lane.split(clear_temp);
     lane.split(temp_alloc_work);
 
     lane.deinit();
@@ -319,7 +375,7 @@ _seen:    [N]u8;
 _compact: [64]int;
 
 collectives_work :: proc() {
-    idx, cnt := lane.index(), lane.count();
+    idx, cnt := lane.index(), lane.active_count();
     assert(cnt == 4, "test assumes 4 lanes");
 
     assert(lane.sum(idx + 1) == 10,        "sum wrong");
