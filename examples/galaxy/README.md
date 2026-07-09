@@ -37,7 +37,7 @@ build.bat galaxy shaders
 
 Every frame issues one `lane.split(simulate, &ctx)`: the same proc runs on every core, with the main thread participating as lane 0 (see `sim.odin`).
 
-- **`split` + `user_data`** — one split per frame; a `Frame_Ctx` pointer carries the frame's inputs in (dt, mouse brush) and the collectives' results back out (energy, bounds).
+- **`split`'s data argument** — one split per frame; a `Frame_Ctx` pointer carries the frame's inputs in (dt, mouse brush) and the collectives' results back out (energy, bounds).
 - **`range`** — each lane takes a static, contiguous slice of the bodies for the force loop. Every body costs the same, so a fixed schedule is right: no cursor, no contention.
 - **`sync`** — the force → integrate phase boundary. No lane may move bodies while another is still summing forces off the old positions.
 - **`sum`** — total kinetic energy, folded across lanes (shown in the window title).

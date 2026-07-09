@@ -65,8 +65,6 @@ import "core:thread";
 
 #assert(thread.IS_SUPPORTED, "Cannot run lanes when threads aren't supported");
 
-Proc :: proc();
-
 MAIN :: 0;
 
 @(private) State :: struct {
@@ -97,9 +95,10 @@ MAX_COLLECTIVE_SIZE :: #config(LANE_MAX_COLLECTIVE_SIZE, 128 when ODIN_ARCH == .
 @(private) _capacity:     int = 1;      // Spawned pool size (lanes = worker threads + main). Fixed between init/deinit.
 @(private) _lanes:        int = 1;      // Participants the next split uses, in [1, _capacity]; set outside splits.
 @(private) _active_count: int = 1;      // Participants in the CURRENT split; 1 outside splits (branch-free active_count).
-@(private) _split_proc:   Proc;
-@(private) _split_data:   rawptr;
-@(private) _split_ctx:    runtime.Context;
+@(private) _split_fn:       rawptr;               // split proc, cast back to its exact type by _split_dispatch
+@(private) _split_data:     rawptr;               // this split's data pointer, or nil
+@(private) _split_dispatch: proc();                // casts _split_fn back and calls it
+@(private) _split_ctx:      runtime.Context;
 @(private) _broadcast:    rawptr;
 @(private) _pending:      csync.Futex;  // Workers still inside the current split.
 @(private) _join_waiting: csync.Futex;  // 1 while the splitter is parked on _pending.
@@ -236,14 +235,37 @@ set_active_count :: proc(n: int, loc := #caller_location) {
 
 // Runs lane_proc on every lane; the caller participates as lane MAIN.
 // Returns once all lanes have finished.
-split :: proc(lane_proc: Proc, user_data: rawptr = nil) {
-    assert(_live, "lane.split called before lane.init.");
-    assert(!_state.active, "lane.split cannot be nested inside a running split.");
-    assert(!csync.atomic_exchange(&_splitting, true), "Concurrent lane.split from multiple threads.");
+split :: proc { split_plain, split_data }
 
-    _split_proc = lane_proc;
-    _split_data = user_data;
-    _split_ctx  = context;
+split_plain :: proc(lane_proc: proc(), loc := #caller_location) {
+    _dispatch :: proc() {
+        fn := cast(proc())_split_fn;
+        fn();
+    }
+    _split_fn       = rawptr(lane_proc);
+    _split_data     = nil;
+    _split_dispatch = _dispatch;
+    _split_run(loc);
+}
+
+split_data :: proc(lane_proc: proc(data: ^$T), data: ^T, loc := #caller_location) {
+    _dispatch :: proc() {
+        fn := cast(proc(^T))_split_fn;
+        fn(cast(^T)_split_data);
+    }
+    _split_fn       = rawptr(lane_proc);
+    _split_data     = data;
+    _split_dispatch = _dispatch;
+    _split_run(loc);
+}
+
+@(private)
+_split_run :: proc(loc := #caller_location) {
+    assert(_live, "lane.split called before lane.init.", loc);
+    assert(!_state.active, "lane.split cannot be nested inside a running split.", loc);
+    assert(!csync.atomic_exchange(&_splitting, true), "Concurrent lane.split from multiple threads.", loc);
+
+    _split_ctx    = context;
     _active_count = _lanes;         // this split's participant count
     _barrier_init(_active_count);   // retarget the barrier (the fallback barrier stores its count)
     csync.atomic_store_explicit(&_pending, csync.Futex(_active_count - 1), .Relaxed);
@@ -252,7 +274,7 @@ split :: proc(lane_proc: Proc, user_data: rawptr = nil) {
 
     _collective_gen = 0;
     _state.active = true;
-    lane_proc();
+    _split_dispatch();
     _state.active = false;
 
     _join();
@@ -303,7 +325,7 @@ _worker :: proc(t: ^thread.Thread) {
 
         _collective_gen = 0;
         _state.active = true;
-        _split_proc();
+        _split_dispatch();
         _state.active = false;
 
         // Last worker out signals the splitter, but only if it is parked.
@@ -326,10 +348,6 @@ is_main      :: #force_inline proc "contextless" () -> bool { return _state.inde
 // splits. This is the stable upper bound on active_count(); size per-lane
 // storage to it (index it with index(), iterate it with active_count()).
 capacity :: #force_inline proc "contextless" () -> int  { return _capacity }
-
-user_data     :: proc { user_data_raw, user_data_t }
-user_data_raw :: #force_inline proc "contextless" ()           -> rawptr { return _split_data }
-user_data_t   :: #force_inline proc "contextless" ($T: typeid) -> T      { return cast(T)_split_data }
 
 // Waits for all lanes to reach the same point before proceeding.
 // No-op outside a split, so SPMD code degrades to correct serial code.

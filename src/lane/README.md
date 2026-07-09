@@ -39,11 +39,10 @@ update_entities :: proc() {
 |---|---|
 | `init(thread_count := 0)` | Spawn the gang; `0` = logical core count. |
 | `deinit()` | Join and free the gang. |
-| `split(p: Proc, user_data: rawptr = nil)` | Run `p` on every lane; returns when all finish. |
+| `split(p: proc())` / `split(p: proc(^T), data: ^T)` | Run `p` on every lane; returns when all finish. `data` is `p`'s private argument, the same pointer on every lane. |
 | `index()` / `active_count()` / `is_main()` | This lane's index, the current split's live lane count, is-lane-0. Serial: `0` / `1` / `true`. |
 | `capacity()` | Fixed pool size (max lanes), valid outside splits; for sizing per-lane storage. |
 | `set_active_count(n)` | Set how many lanes the next split(s) use: `[1, capacity()]`, or `0` for all. Asserted in range, outside a split only. |
-| `user_data()` / `user_data(^T)` | The split's user pointer, raw or cast. |
 | `range(n or slice)` | This lane's static share: `(lo, hi)` bounds from a length, `(sub-slice, base index)` from a slice. |
 | `grab(&cursor, n or slice, chunk_size)` | Dynamic chunking off a shared atomic cursor. |
 | `task_lane(n)` | The lane that task `n` folds onto (`n % active_count()`). |
@@ -56,7 +55,7 @@ update_entities :: proc() {
 | `sum` / `minimum` / `maximum` / `any_of` / `all_of` | Common reductions; result on every lane. |
 | `reduce(value, combine)` | Custom reduction, deterministic left-fold in lane order. |
 | `scan(value)` / `scan(value, identity, combine)` | Exclusive prefix sum/fold; returns `(offset/prefix, total)`. |
-| `MAIN`, `Proc`, `MAX_COLLECTIVE_SIZE` | Lane 0's index; the split proc type; collective value size limit in bytes — `-define:LANE_MAX_COLLECTIVE_SIZE` (power of two; defaults to the target's cache line: 64, or 128 on Apple Silicon). |
+| `MAIN`, `MAX_COLLECTIVE_SIZE` | Lane 0's index; collective value size limit in bytes — `-define:LANE_MAX_COLLECTIVE_SIZE` (power of two; defaults to the target's cache line: 64, or 128 on Apple Silicon). |
 
 ---
 
@@ -160,7 +159,7 @@ The barrier is, by default, a sense-reversing futex barrier that spins briefly b
 
 ## Moving data around
 
-**`user_data`** carries one pointer into the split:
+**`split`'s `data` argument** carries one pointer into the split, typed: pass `p`'s expected pointer type and `split` checks it at the call site, so there's no cast to get wrong inside the split proc:
 
 ```odin
 Frame_Ctx :: struct { dt: f32, input: ^Input };
@@ -169,8 +168,7 @@ frame :: proc(ctx: ^Frame_Ctx) {
     lane.split(tick, ctx);
 }
 
-tick :: proc() {
-    ctx := lane.user_data(^Frame_Ctx);
+tick :: proc(ctx: ^Frame_Ctx) {
     ...
 }
 ```

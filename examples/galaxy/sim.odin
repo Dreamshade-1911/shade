@@ -104,8 +104,8 @@ AABB :: struct {
     mx: Vec2,
 };
 
-// One pointer's worth of per-frame state handed to the split via user_data,
-// plus the two results the collectives write back for the main thread to read.
+// Per-frame state handed to the split as simulate's argument, plus the two
+// results the collectives write back for the main thread to read.
 Frame_Ctx :: struct {
     dt:               f32,
     attractor:        Vec2,
@@ -158,8 +158,7 @@ deinit_bodies :: proc() {
 
 // Runs on every lane. `lane.split(simulate, &ctx)` calls it once per core; the
 // calling (main) thread is lane 0 and participates like any other.
-simulate :: proc() {
-    ctx := lane.user_data(^Frame_Ctx);
+simulate :: proc(ctx: ^Frame_Ctx) {
     dt  := ctx.dt;
     n   := body_count();
     padded := len(g_hot);

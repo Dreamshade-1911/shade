@@ -284,7 +284,7 @@ case_once :: proc() {
     delete(s);
 }
 
-sum_work :: proc() {
+sum_work :: proc(tag: ^int) {
     lo, hi := lane.range(N);
     s := 0;
     for i in lo ..< hi do s += _data[i];
@@ -304,8 +304,8 @@ sum_work :: proc() {
     lane.broadcast(&magic);
     assert(magic == 12345, "broadcast failed");
 
-    // Check user_data plumbing.
-    assert(lane.user_data(^int)^ == 777, "user_data failed");
+    // Check the split's data argument plumbing.
+    assert(tag^ == 777, "split data argument failed");
 }
 
 fill_data :: proc() {
