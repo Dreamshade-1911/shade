@@ -9,6 +9,8 @@ import sdl "vendor:sdl3";
 
 import "shade:lane";
 
+import common "../_common";
+
 // -----------------------------------------------------------------------------
 // examples/galaxy: an interactive N-body galaxy that runs its physics across
 // every core with `shade:lane` (see sim.odin) and draws it with SDL_gpu.
@@ -26,8 +28,9 @@ import "shade:lane";
 
 FT_HISTORY :: 180;   // frame-time samples kept for the graph (~3s at 60Hz)
 
-PARTICLE_WORLD_RADIUS :: 8.0;   // dot radius in world units (scales with zoom)
-PARTICLE_MIN_PX       :: 1.5;   // ...but never smaller than this on screen
+PARTICLE_WORLD_RADIUS :: 8.0;    // dot radius in world units (scales with zoom)
+PARTICLE_MIN_PX       :: 1.5;    // ...but never smaller than this on screen
+MAX_DT                :: 1.0 / 60.0; // so the physics doesn't screw up
 
 App :: struct {
     window:   ^sdl.Window,
@@ -86,7 +89,7 @@ start :: proc() -> bool {
     }
     defer sdl.DestroyWindow(g_app.window);
 
-    g_app.gpu = sdl.CreateGPUDevice({ .SPIRV }, ODIN_DEBUG, nil);
+    g_app.gpu = sdl.CreateGPUDevice(common.SHADER_FORMATS, ODIN_DEBUG, nil);
     if g_app.gpu == nil {
         return log_error("CreateGPUDevice failed");
     }
@@ -151,6 +154,7 @@ frame :: proc() {
     dt := f32(time.duration_seconds(time.tick_lap_time(&a.last_tick)));
     a.frame_ms = dt * 1000;
     a.fps      = (1.0 / dt) if dt > 0 else 0;
+    dt = min(dt, MAX_DT);
 
     poll_events();
     a.refresh_rate = get_refresh_rate();

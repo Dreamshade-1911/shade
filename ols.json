@@ -1,7 +1,7 @@
 {
     "$schema": "https://raw.githubusercontent.com/DanielGavin/ols/master/misc/ols.schema.json",
     "collections": [
-        { "name": "src", "path": "src" }
+        { "name": "shade", "path": "src" }
     ],
     "profile": "default",
     "profiles": [

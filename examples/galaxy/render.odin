@@ -5,6 +5,8 @@ import "core:mem";
 
 import sdl "vendor:sdl3";
 
+import common "../_common";
+
 // -----------------------------------------------------------------------------
 // A small SDL_gpu renderer: one additive-blended pipeline draws the particles as
 // instanced quads (a soft round glow per body), and one alpha-blended pipeline
@@ -40,13 +42,6 @@ Viewport_UBO :: struct {
 };
 
 HUD_MAX_VERTS :: 16384;
-
-PARTICLE_VERT_SPV :: #load("../../data/galaxy/particle.vert.spv");
-PARTICLE_FRAG_SPV :: #load("../../data/galaxy/particle.frag.spv");
-STAR_VERT_SPV     :: #load("../../data/galaxy/star.vert.spv");
-STAR_FRAG_SPV     :: #load("../../data/galaxy/star.frag.spv");
-HUD_VERT_SPV      :: #load("../../data/galaxy/hud.vert.spv");
-HUD_FRAG_SPV      :: #load("../../data/galaxy/hud.frag.spv");
 
 // Premultiplied additive: soft-edged dots that bloom where they overlap (the
 // fragment's radial falloff gives the transparent rim). Particles + starfield.
@@ -84,11 +79,10 @@ Renderer :: struct {
 };
 
 // Everything that varies between this example's pipelines. All three share the
-// same skeleton: SPIR-V vert/frag pair, one vertex uniform buffer, and a single
-// blended color target in the swapchain format.
+// same skeleton: a vert/frag pair loaded by name from the data folder, one
+// vertex uniform buffer, and a single blended color target in the swapchain
+// format. `name` doubles as the shader file stem (e.g. "hud" -> "hud.vert.*").
 Pipeline_Desc :: struct {
-    vert_spv:       []u8,
-    frag_spv:       []u8,
     primitive:      sdl.GPUPrimitiveType,
     vertex_buffers: []sdl.GPUVertexBufferDescription,   // empty = no vertex input
     vertex_attrs:   []sdl.GPUVertexAttribute,
@@ -101,33 +95,13 @@ create_pipeline :: proc(
     name:   string,
     desc:   Pipeline_Desc,
 ) -> ^sdl.GPUGraphicsPipeline {
-    vs := sdl.CreateGPUShader(gpu, {
-        code_size           = len(desc.vert_spv),
-        code                = raw_data(desc.vert_spv),
-        entrypoint          = "main",
-        format              = { .SPIRV },
-        stage               = .VERTEX,
-        num_uniform_buffers = 1,
-    });
-    fs := sdl.CreateGPUShader(gpu, {
-        code_size  = len(desc.frag_spv),
-        code       = raw_data(desc.frag_spv),
-        entrypoint = "main",
-        format     = { .SPIRV },
-        stage      = .FRAGMENT,
-    });
-    defer if vs != nil do sdl.ReleaseGPUShader(gpu, vs);
-    defer if fs != nil do sdl.ReleaseGPUShader(gpu, fs);
-    if vs == nil || fs == nil {
-        log_error(fmt.tprintf("Failed to create %s shaders", name));
-        return nil;
-    }
-
+    shaders := [?]sdl.GPUShaderCreateInfo {
+        { stage = .VERTEX, num_uniform_buffers = 1 },   // the camera/viewport UBO
+        { stage = .FRAGMENT },
+    };
     color_target := sdl.GPUColorTargetDescription { format = format, blend_state = desc.blend };
-    pipeline := sdl.CreateGPUGraphicsPipeline(gpu, {
-        vertex_shader   = vs,
-        fragment_shader = fs,
-        primitive_type  = desc.primitive,
+    pipeline := common.create_pipeline(gpu, name, shaders[:], {
+        primitive_type = desc.primitive,
         vertex_input_state = {
             vertex_buffer_descriptions = raw_data(desc.vertex_buffers),
             num_vertex_buffers         = u32(len(desc.vertex_buffers)),
@@ -157,8 +131,6 @@ init_renderer :: proc(gpu: ^sdl.GPUDevice, window: ^sdl.Window) -> (r: Renderer,
         { location = 2, buffer_slot = 1, format = .UBYTE4_NORM, offset = u32(offset_of(Instance, color)) },
     };
     r.particle_pipeline = create_pipeline(gpu, swapchain_format, "particle", {
-        vert_spv       = PARTICLE_VERT_SPV,
-        frag_spv       = PARTICLE_FRAG_SPV,
         primitive      = .TRIANGLESTRIP,
         vertex_buffers = particle_buffers[:],
         vertex_attrs   = particle_attrs[:],
@@ -168,8 +140,6 @@ init_renderer :: proc(gpu: ^sdl.GPUDevice, window: ^sdl.Window) -> (r: Renderer,
     // Starfield: no vertex input, the vertex shader builds a fullscreen
     // triangle from its index.
     r.star_pipeline = create_pipeline(gpu, swapchain_format, "star", {
-        vert_spv  = STAR_VERT_SPV,
-        frag_spv  = STAR_FRAG_SPV,
         primitive = .TRIANGLELIST,
         blend     = BLEND_ADDITIVE,
     });
@@ -182,9 +152,7 @@ init_renderer :: proc(gpu: ^sdl.GPUDevice, window: ^sdl.Window) -> (r: Renderer,
         { location = 0, buffer_slot = 0, format = .FLOAT2,      offset = u32(offset_of(Hud_Vertex, pos)) },
         { location = 1, buffer_slot = 0, format = .UBYTE4_NORM, offset = u32(offset_of(Hud_Vertex, color)) },
     };
-    r.hud_pipeline = create_pipeline(gpu, swapchain_format, "HUD", {
-        vert_spv       = HUD_VERT_SPV,
-        frag_spv       = HUD_FRAG_SPV,
+    r.hud_pipeline = create_pipeline(gpu, swapchain_format, "hud", {
         primitive      = .TRIANGLELIST,
         vertex_buffers = hud_buffers[:],
         vertex_attrs   = hud_attrs[:],
