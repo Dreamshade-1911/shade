@@ -3,3 +3,4 @@
 *.bat text eol=crlf
 *.sh text eol=lf
 *.spv binary
+*.dxil binary
